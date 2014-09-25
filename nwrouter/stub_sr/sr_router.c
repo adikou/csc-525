@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <netinet/in.h>
-#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sr_if.h"
@@ -24,18 +24,21 @@
 //Added ARP cache include - AK
 #include "sr_arp_cache.h"
 
-void sr_print_packet_contents(struct sr_instance*, uint8_t*, unsigned int , char*);
-/*Initialise an empty ARP cache */
-struct sr_arp_cache *arp_cache_root = 0;
 
+/*Initialise an empty ARP cache */
+struct sr_arp_cache *arp_cache_root = NULL; 
+
+
+void sr_print_packet_contents(struct sr_instance*, uint8_t*, unsigned int , char*);
+void print_ethernet_address(uint8_t *);
 
 /*--------------------------------------------------------------------- 
  * Method: sr_init(void)
  * Scope:  Global
  *
  * Initialize the routing subsystem
- * 
- * \TODO Perhaps initialise ARP cache here? 
+ *
+ * Sets global variables - vrhost IP address and MAC address 
  *
  *---------------------------------------------------------------------*/
 
@@ -43,13 +46,30 @@ void sr_init(struct sr_instance* sr)
 {
     /* REQUIRES */
     assert(sr);
-
     /* Add initialization code here! */
-    /* Set IP of vrhost to be visible globally */
-    struct in_addr *ip_vrhost = 0;
-    inet_aton("172.29.10.136", ip_vrhost);
 
-  } /* -- sr_init -- */
+} /* -- sr_init -- */
+
+/*--------------------------------------------------------------------- 
+ * Method: print_arp_cache
+ * Scope:  Local
+ *
+ * Print the ARP cache
+ *
+ * @author : Aditya Kousik
+ * @date   : 23-09-2014
+ *
+ *---------------------------------------------------------------------*/
+void print_arp_cache()
+{
+    struct sr_arp_cache *cur = arp_cache_root;
+    while(cur->next != NULL)
+    {
+	printf("\n%u %x ", ntohs(cur->arp_type), ntohl(cur->arp_sip)); 
+	print_ethernet_address(cur->arp_sha);
+	cur = cur->next;
+    }
+}
 
 /*--------------------------------------------------------------------- 
  * Method: add_arp_cache_tuple
@@ -63,19 +83,29 @@ void sr_init(struct sr_instance* sr)
  *
  *---------------------------------------------------------------------*/
 
-void add_arp_cache_tuple(struct sr_arp_cache tuple)
+void add_arp_cache_tuple(struct sr_arp_cache *tuple)
 {
     int fail = 0;
-    struct sr_arp_cache *root, *new;
-    root = arp_cache_root; 
-
-    while(root = root->next) { } 
-    new = (struct sr_arp_cache*) malloc(sizeof(struct sr_arp_cache));
-    new->arp_type = tuple.arp_type; new->arp_sip = tuple.arp_sip;
-    memcpy((void*)&new->arp_sha, (void*)&tuple.arp_sha, ETHER_ADDR_LEN);
+    struct sr_arp_cache *cur, *new;
+    cur = arp_cache_root; 
+    
+    new = (struct sr_arp_cache*)malloc(sizeof(struct sr_arp_cache));
+    new->arp_type = tuple->arp_type; new->arp_sip = tuple->arp_sip;
+    memcpy(new->arp_sha, tuple->arp_sha, ETHER_ADDR_LEN);
     new->next = NULL; 
-    if(root == NULL) root = new;
-        else root->next = new;
+
+    if(arp_cache_root == NULL)
+    { 
+	arp_cache_root = new;
+	arp_cache_root->next = NULL;
+    }
+	else
+	{	    
+	    while(cur->next !=NULL) { cur = cur->next; } 
+	    new->next = NULL;
+	    cur->next = new;
+	}
+        
 }
 
 /*--------------------------------------------------------------------- 
@@ -89,20 +119,22 @@ void add_arp_cache_tuple(struct sr_arp_cache tuple)
  *
  *---------------------------------------------------------------------*/
 
-int walk_arp_cache(struct sr_arp_cache tuple)
+int walk_arp_cache(struct sr_arp_cache *tuple)
 {
     int fail = 0;
-    struct sr_arp_cache *root = arp_cache_root;
-    while(root->next)
+    struct sr_arp_cache *cur;
+    if(arp_cache_root == NULL) return fail;
+    cur = arp_cache_root;
+    while(cur->next)
     {
-	if(root->arp_type == tuple.arp_type && root->arp_sip == tuple.arp_sip)
+	if(cur->arp_type == tuple->arp_type && cur->arp_sip == tuple->arp_sip)
 	{
 	    /*There is a <proto_type,sender_address> present. 
 	     *Let's update its hw_addr */
-	    memcpy((void*)&root->arp_sha, (void*)(&tuple.arp_sha),ETHER_ADDR_LEN);
+	    memcpy(cur->arp_sha, tuple->arp_sha,ETHER_ADDR_LEN);
 	    return ++fail;
 	}
-	root = root->next;
+	cur = cur->next;
     }
     return fail;
 }
@@ -124,31 +156,57 @@ int walk_arp_cache(struct sr_arp_cache tuple)
  *---------------------------------------------------------------------*/
 
 int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost, 
-	uint16_t type, uint8_t* payload)
+			  uint16_t type, uint8_t* payload, struct in_addr ip_vrhost, 
+			  unsigned char* mac_vrhost)
 {
 
-    int errno = 0, merge_flag;
+    int errno, merge_flag, ips_are_same;
     struct sr_arphdr *arp_hdr;
     struct sr_arp_cache cur;
-
     struct ip *ip_hdr;
-	
+    unsigned char buf[ETHER_ADDR_LEN];
+    uint32_t ipbuf;
+    
+    printf("\n#2vrhost MAC address ");
+    print_ethernet_address((uint8_t*)mac_vrhost);
+    printf("\n#3vrhost IP address: %s", inet_ntoa(ip_vrhost));
+
+    errno = -1;
     switch(type)
     {
-	case ETHERTYPE_ARP: arp_hdr = (struct sr_arphdr*)payload;
-			    cur.arp_type = type; cur.arp_sip = arp_hdr->ar_sip;
-			    memcpy((void*)&cur.arp_sha, (void*)&arp_hdr->ar_sha, ETHER_ADDR_LEN);
-			    merge_flag = walk_arp_cache(cur);
+	case ETHERTYPE_ARP: 
+			    arp_hdr = (struct sr_arphdr*)payload; 
+			    cur.arp_type = arp_hdr->ar_pro; cur.arp_sip = htonl(arp_hdr->ar_sip);
+			    memcpy(cur.arp_sha, arp_hdr->ar_sha, ETHER_ADDR_LEN);
+			    merge_flag = walk_arp_cache(&cur);
 			    //If the target IP is really mine
-			    if(1) 
+			    ips_are_same = arp_hdr->ar_tip == *((uint32_t*)&(ip_vrhost));
+			    if(ips_are_same)
 			    {
 				if(merge_flag == 0)
-				    add_arp_cache_tuple(cur);
-				if(arp_hdr->ar_op == ARP_REQUEST)
+				    add_arp_cache_tuple(&cur);
+				//else print_arp_cache();
+				if(ntohs(arp_hdr->ar_op) == ARP_REQUEST)
 				{
+				    /* Set OPCODE to ARP_REPLY */
+				    arp_hdr->ar_op = htons(ARP_REPLY);
+				    
+				    /* Swap sha and tha fields */
+				    memcpy(buf, arp_hdr->ar_sha, ETHER_ADDR_LEN);
+				    memcpy(arp_hdr->ar_sha,arp_hdr->ar_tha, ETHER_ADDR_LEN);
+				    memcpy(arp_hdr->ar_tha, buf, ETHER_ADDR_LEN);
+
+				    /* Set sha to local address */
+				    memcpy(arp_hdr->ar_sha, mac_vrhost, ETHER_ADDR_LEN);
+
+				    /* Swap the sip and tip fields*/
+				    ipbuf = arp_hdr->ar_sip;
+				    arp_hdr->ar_sip = arp_hdr->ar_tip;
+				    arp_hdr->ar_tip = ipbuf;			    
 				}
 					
 			    }
+			    errno = 0;
 			    break;
 	case ETHERTYPE_IP : break;
 	default : errno = -1; break;
@@ -192,53 +250,74 @@ void sr_handlepacket(struct sr_instance* sr,
 
     struct sr_instance *tmp;
     struct sr_ethernet_hdr *ethernet_hdr  = 0;
-    uint8_t dest_addr[ETHER_ADDR_LEN], src_addr[ETHER_ADDR_LEN], *payload = 0;    
+    struct sr_if *if_packet = 0;
+    
+    /* VR Host IP address and MAC address */
+    struct in_addr ip_vrhost;
+    unsigned char mac_vrhost[ETHER_ADDR_LEN];
+    
+    uint8_t dest_addr[ETHER_ADDR_LEN], src_addr[ETHER_ADDR_LEN], buf[ETHER_ADDR_LEN];
+    uint8_t *payload = 0;    
+    
     uint16_t type;
+    int errno, byteCount;
 
+    /* Resolve interfaces - where the packet is coming from */
+    if_packet = sr_get_interface(sr, interface);
+    sr_print_if(if_packet);   
+    
+    /* Set IP of vrhost to be visible globally */
+    ip_vrhost.s_addr = if_packet->ip;
+    printf("\nvrhost IP address: %s", inet_ntoa(ip_vrhost));
+    
+    memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
+    printf("\nvrhost MAC address: ");
+    print_ethernet_address((uint8_t*)mac_vrhost);
+    
     tmp = sr;
-
-    printf("*** -> Received packet of length %d \n",len);
-    // Skip this print call for now. Used only for debugging
-    //sr_print_packet_contents(tmp, packet, len, interface);
-
+    printf("\n*** -> Received packet of length %d \n",len);
+ 
+    // For Debugging. Print contents of packet before processing.
+    sr_print_packet_contents(tmp, packet, len, interface);
+    
     /*  Begin traversing the packet list */
-    ethernet_hdr = (struct sr_ethernet_hdr *)packet;
-    memcpy((void*)&dest_addr, (void*)&ethernet_hdr->ether_dhost, ETHER_ADDR_LEN);
-    memcpy((void*)&src_addr, (void*)&ethernet_hdr->ether_shost, ETHER_ADDR_LEN);   
-    memcpy((void*)&type, (void*)&ethernet_hdr->ether_type, sizeof(uint16_t));
-    type = ntohs(type);
-    payload = (uint8_t*)(packet + sizeof(struct sr_ethernet_hdr)); 
+    ethernet_hdr = (struct sr_ethernet_hdr *) packet;
+    payload = (uint8_t *) (packet + sizeof(struct sr_ethernet_hdr));
 
-    sr_handle_ether_frame(dest_addr, src_addr, type, payload); 
+    //Clear the memory - causing too much segfaults
+    memset((void*)&dest_addr, 0, sizeof(uint8_t));
+    memcpy(dest_addr, ethernet_hdr->ether_dhost, ETHER_ADDR_LEN);
+    memset((void*)&src_addr, 0, sizeof(uint8_t));
+    memcpy(src_addr, ethernet_hdr->ether_shost, ETHER_ADDR_LEN);
+    type = ethernet_hdr->ether_type;
+    type = ntohs(type);
+    
+    errno = sr_handle_ether_frame(dest_addr, src_addr, type, payload,
+				  ip_vrhost, mac_vrhost);
+    
+    /* The payload already has the ARP reply in it. 
+     * Swap the Source and Destination MAC address in the Ethernet header 
+     * and send it back along the receiving interface.
+    */
+    memcpy(buf, ethernet_hdr->ether_shost, ETHER_ADDR_LEN);
+    memcpy(ethernet_hdr->ether_shost,ethernet_hdr->ether_dhost, ETHER_ADDR_LEN);
+    memcpy(ethernet_hdr->ether_dhost, buf, ETHER_ADDR_LEN);
+
+    /* Conversion of unsigned char to uint8_t seems to be er.... "pita"  */
+    byteCount = 0;
+    while(byteCount < ETHER_ADDR_LEN) 
+    {
+	ethernet_hdr->ether_shost[byteCount] = *(uint8_t*)(&mac_vrhost[byteCount]);
+	byteCount++;
+    }
+
+    /* For Debugging. Printing contents of packet just before sending it back */
+    sr_print_packet_contents(tmp, packet, len, interface);
+
+    /*Packet is ready and valid. Send it */
+    sr_send_packet(sr, packet, len, interface);
 
 }/* end sr_ForwardPacket */
-
-/*--------------------------------------------------------------------- 
- * Method: resolve_ethernet_address
- * Scope:  Global
- *
- * Run system calls to find out mac address of current router
- * and return the MAC address. 
- *
- * @author : Aditya Kousik
- * @date   : 23-09-2014
- *
- *---------------------------------------------------------------------*/
-
-/* TODO FINISH THIS FUNCTION!! Either use syscalls or resolve into some
- * tangible data structure
- */
-
-void resolve_ethernet_address()
-{
-    char *fname = "/sys/class/net/eth0/address", *buf;
-    FILE *fp;
-    uint8_t hw_addr[ETHER_ADDR_LEN];
-
-    fp = fopen(fp, "r");	
-    
-}
-
 
 /*--------------------------------------------------------------------- 
  * Method: print_ethernet_address
@@ -285,11 +364,7 @@ void sr_print_packet_contents(struct sr_instance* sr,
 
     assert(sr);
 
-    printf("----------Contents of sr_instance---------\n");
-    printf("Socket FD: %d\t User name: %s\t Hostname: %s\t Hostfile name : %s\n", sr->sockfd, sr->user, sr->host, sr->auth_key_fn);
-    printf("Topology id: %d\t", sr->topo_id);
-    printf("Interface: %s\n", iface);
-    
+   
     /*  Begin traversing the packet list */
     ethernet_hdr = (struct sr_ethernet_hdr *)packet;
     arp_hdr = (struct sr_arphdr *)(packet + sizeof(struct sr_ethernet_hdr));
@@ -304,17 +379,19 @@ void sr_print_packet_contents(struct sr_instance* sr,
     printf("\nEthernet Type : %x", ntohs(ethernet_hdr->ether_type));  
     printf("\n------------End of Ethernet header--------------");
 
-    printf("\n\n------------ARP header--------------");
-    printf("\nHw addr format: %x\t Protocol addr format: %x\t ARP opcode: %x\t", 
-            ntohs(arp_hdr->ar_hrd), ntohs(arp_hdr->ar_pro), ntohs(arp_hdr->ar_op));
+    if(ntohs(ethernet_hdr->ether_type) == ETHERTYPE_ARP)
+    {
+    	printf("\n\n------------ARP header--------------");
+    	printf("\nHw addr format: %x\t Protocol addr format: %x\t ARP opcode: %x\t", 
+        ntohs(arp_hdr->ar_hrd), ntohs(arp_hdr->ar_pro), ntohs(arp_hdr->ar_op));
 
-    printf("\nSender hardware address: ");
-    print_ethernet_address((uint8_t*)&arp_hdr->ar_sha);
-    printf("\tSender IP address: %s\t", inet_ntoa(*(struct in_addr*)&arp_hdr->ar_sip));
-    printf("\nDestination hardware address: ");
-    print_ethernet_address((uint8_t*)&arp_hdr->ar_tha);
-    printf("\tDestination IP address: %s\t", inet_ntoa(*(struct in_addr*)&arp_hdr->ar_tip));
-    printf("\n---------End of ARP header-----------\n");
- 	
+	printf("\nSender hardware address: ");
+	print_ethernet_address((uint8_t*)&arp_hdr->ar_sha);
+	printf("\tSender IP address: %s\t", inet_ntoa(*(struct in_addr*)&arp_hdr->ar_sip));
+	printf("\nDestination hardware address: ");
+	print_ethernet_address((uint8_t*)&arp_hdr->ar_tha);
+	printf("\tDestination IP address: %s\t", inet_ntoa(*(struct in_addr*)&arp_hdr->ar_tip));
+	printf("\n---------End of ARP header-----------\n");
+    } 	
     
 }
