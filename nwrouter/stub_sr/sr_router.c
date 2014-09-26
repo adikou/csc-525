@@ -29,12 +29,6 @@
 struct sr_arp_cache *arp_cache_root = NULL; 
 
 
-void sr_print_packet_contents(struct sr_instance*, uint8_t*, unsigned int , char*);
-void print_ethernet_address(uint8_t *);
-int  verify_checksum(uint16_t *, int);
-int  forward_packet(struct sr_instance*, struct sr_ethernet_hdr*,
-		    uint8_t*, unsigned int, char*, int);
-
 /*--------------------------------------------------------------------- 
  * Method: sr_init(void)
  * Scope:  Global
@@ -157,6 +151,7 @@ int verify_checksum (uint16_t *twoByte, int size)
 {
     int twoByteCount = 0;
     unsigned long sum = 0;
+    int retval = 0;
 
     while(twoByteCount < size/2)
     {
@@ -170,9 +165,8 @@ int verify_checksum (uint16_t *twoByte, int size)
 	}
 	twoByteCount++;	
     }
-    printf("\nChecksum : %x\n", sum); 
-
-    return(~(sum & 0xffff));
+    retval = sum;
+    return((uint16_t)(~(retval & 0xffff)));
 }
 
 /*--------------------------------------------------------------------- 
@@ -197,11 +191,13 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 {
 
     /* ARP declarations */
-    int 	  errno, merge_flag, ips_are_same;
+    int 	  merge_flag, ips_are_same;
     struct 	  sr_arphdr *arp_hdr;
     struct 	  sr_arp_cache cur;
     unsigned char buf[ETHER_ADDR_LEN];
-    
+    struct sr_rt* rt_entry;    
+    unsigned long errno;
+
     /* IP declarations */
     uint32_t      ipbuf;
     struct ip     *ip_hdr;
@@ -219,7 +215,6 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 
     /* Resolve interfaces - where the packet is coming from */
     if_packet = sr_get_interface(sr, interface);
-    sr_print_if(if_packet);   
     
     ip_vrhost.s_addr = if_packet->ip;
     printf("\nvrhost IP address: %s", inet_ntoa(ip_vrhost));
@@ -275,13 +270,15 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 
 			    /* Verify checksum */
 			    errno = verify_checksum(twoByte, size);
-			    if(!errno) 
-			    { errno = ERR_RSP_IP_CHKSUM; break; }
+			    if(errno) 
+			    { errno = ERR_RSP_IP_CHKSUM;  break; }
 
 			    /*Verify TTL validity */
-			    if(ip_hdr->ip_ttl >= 0)
+			    if(ip_hdr->ip_ttl <= 0)
 			    { errno = ERR_RSP_IP_TTL; break; }
 
+			    rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst);
+			    
 			    break;
 	default : errno = -1; break;
     }
@@ -324,13 +321,6 @@ void sr_handlepacket(struct sr_instance* sr,
     struct  sr_ethernet_hdr *ethernet_hdr  = 0;
     uint8_t dest_addr[ETHER_ADDR_LEN], src_addr[ETHER_ADDR_LEN], buf[ETHER_ADDR_LEN];
     uint8_t *payload = 0;    
-
-    /* Interface names. Keep a Copy of the old interface name. 
-     * Pass the newInterface to handle frame method. If it comes across
-     * an IP type packet, based on forwarding the interface name may get 
-     * changed. 
-     */
-
     uint16_t type;
     int errno, byteCount, result;
    
@@ -357,13 +347,83 @@ void sr_handlepacket(struct sr_instance* sr,
    				  sr, interface);
  
     /* Pass on what to do with the packet */
-    result = forward_packet(sr, ethernet_hdr, packet, len, interface, errno);
+    result = sr_forward_packet(sr, ethernet_hdr, packet, len, interface, errno);
 
 }/* end sr_ForwardPacket */
 
+/*--------------------------------------------------------------------- 
+ * Method: count_umask_bits
+ * Scope:  Global
+ *
+ * Count the number of bits not masked by subnet mask. 
+ * Works only for values of the order 2^n - 1
+ * 
+ * @author : Aditya Kousik
+ * @date   : 26-09-2014
+ *
+ *---------------------------------------------------------------------*/
+
+int count_umask_bits(uint32_t num)
+{
+    int count;
+
+    num = ~num;  
+    for(count = 0; num; count++) 
+	num = num >> 1;
+    return count;
+}
 
 /*--------------------------------------------------------------------- 
- * Method: forward_packet
+ * Method: sr_rtable_prefix_lookup
+ * Scope:  Global
+ *
+ * Perform longest prefix match for the given IP address from the 
+ * rtable entries. Return the tuple with longest prefix match.
+ * Return default gateway or drop packet if nothing is found.
+ * 
+ * @author : Aditya Kousik
+ * @date   : 25-09-2014
+ *
+ *---------------------------------------------------------------------*/
+struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
+				      struct in_addr ip)
+{
+    struct sr_rt *rtable_entry = 0, *greatest_match = 0;
+    uint32_t buf = 0, leastXOR = 0;
+    int bitCount, numBits;
+    
+    rtable_entry = sr->routing_table;
+    if(rtable_entry == 0) return(0);
+
+    while(rtable_entry)
+    {
+	/* Number of subnet bits as per CIDR  */
+	numBits = count_umask_bits(ntohl(rtable_entry->mask.s_addr));
+
+	/* Truncate that many number of bits, because we don't need them */
+	buf = ntohl(rtable_entry->dest.s_addr) >> numBits;
+
+	/* XOR the entire value with the ip address  */
+	buf = buf ^ (ntohl(ip.s_addr) >> numBits);
+
+	if(greatest_match == NULL)
+	{
+	    leastXOR = buf;
+	    greatest_match = rtable_entry;
+	}
+	    else if(buf < leastXOR) 
+	    {
+		greatest_match = rtable_entry;
+		leastXOR = buf;
+	    }
+
+	rtable_entry = rtable_entry->next;
+    }
+    return greatest_match;
+}
+
+/*--------------------------------------------------------------------- 
+ * Method: sr_forward_packet
  * Scope:  Global
  *
  * Choose what to do with the packet based on the return value from 
@@ -373,7 +433,7 @@ void sr_handlepacket(struct sr_instance* sr,
  * @date   : 25-09-2014
  *
  *---------------------------------------------------------------------*/
-int forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_hdr, 
+int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_hdr, 
 		   uint8_t* packet, unsigned int len, 
 		   char* interface, int errno)
 {
@@ -423,7 +483,7 @@ int forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_hdr,
 	byteCount++;
     }
  
-    /* For Debugging. Printing contents of packet just before sending it back */
+    /* For Debugging. Printing contents of packet just before sending it */
     sr_print_packet_contents(sr, packet, len, interface);
 
   
@@ -493,7 +553,7 @@ void sr_print_packet_contents(struct sr_instance* sr,
     printf("\nSource MAC address : \t");
     print_ethernet_address(ethernet_hdr->ether_shost);	
     printf("\nEthernet Type : %x", ntohs(ethernet_hdr->ether_type));  
-    printf("\n------------End of Ethernet header--------------");
+    printf("\n------------End of Ethernet header--------------\n");
 
     if(ntohs(ethernet_hdr->ether_type) == ETHERTYPE_ARP)
     {
