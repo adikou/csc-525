@@ -32,6 +32,15 @@
 #define INIT_TTL 255
 #define PACKET_DUMP_SIZE 1024
 
+/* #defines for standard error handling and response values */
+#define ERR_RSP_ERR       0
+#define ERR_RSP_ARP_REQ   1
+#define ERR_RSP_ARP_REP   2
+#define ERR_RSP_IP_CHKSUM 3
+#define ERR_RSP_IP_TTL	  4  
+#define ERR_RSP_IP_FWD	  5
+#define ERR_RSP_ICMP      6
+
 /* forward declare */
 struct sr_if;
 struct sr_rt;

@@ -31,6 +31,9 @@ struct sr_arp_cache *arp_cache_root = NULL;
 
 void sr_print_packet_contents(struct sr_instance*, uint8_t*, unsigned int , char*);
 void print_ethernet_address(uint8_t *);
+int  verify_checksum(uint16_t *, int);
+int  forward_packet(struct sr_instance*, struct sr_ethernet_hdr*,
+		    uint8_t*, unsigned int, char*, int);
 
 /*--------------------------------------------------------------------- 
  * Method: sr_init(void)
@@ -140,6 +143,39 @@ int walk_arp_cache(struct sr_arp_cache *tuple)
 }
 
 /*--------------------------------------------------------------------- 
+ * Method: verify_checksum
+ * Scope:  Local
+ *
+ * Verify checksum of the IP header.
+ *
+ * @author : Aditya Kousik
+ * @date   : 25-09-2014
+ *
+ *---------------------------------------------------------------------*/
+
+int verify_checksum (uint16_t *twoByte, int size)
+{
+    int twoByteCount = 0;
+    unsigned long sum = 0;
+
+    while(twoByteCount < size/2)
+    {
+	sum += *(twoByte++);
+		
+	/* Carry occurred */
+	if(sum & 0xffff0000)
+	{
+	    sum &= 0xffff; 
+	    sum++;
+	}
+	twoByteCount++;	
+    }
+    printf("\nChecksum : %x\n", sum); 
+
+    return(~(sum & 0xffff));
+}
+
+/*--------------------------------------------------------------------- 
  * Method: sr_handle_ether_frame
  * Scope:  Global
  *
@@ -156,21 +192,42 @@ int walk_arp_cache(struct sr_arp_cache *tuple)
  *---------------------------------------------------------------------*/
 
 int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost, 
-			  uint16_t type, uint8_t* payload, struct in_addr ip_vrhost, 
-			  unsigned char* mac_vrhost)
+			  uint16_t type, uint8_t* payload, 
+			  struct sr_instance* sr, char* interface) 
 {
 
-    int errno, merge_flag, ips_are_same;
-    struct sr_arphdr *arp_hdr;
-    struct sr_arp_cache cur;
-    struct ip *ip_hdr;
+    /* ARP declarations */
+    int 	  errno, merge_flag, ips_are_same;
+    struct 	  sr_arphdr *arp_hdr;
+    struct 	  sr_arp_cache cur;
     unsigned char buf[ETHER_ADDR_LEN];
-    uint32_t ipbuf;
     
-    printf("\n#2vrhost MAC address ");
-    print_ethernet_address((uint8_t*)mac_vrhost);
-    printf("\n#3vrhost IP address: %s", inet_ntoa(ip_vrhost));
+    /* IP declarations */
+    uint32_t      ipbuf;
+    struct ip     *ip_hdr;
+    uint16_t      *twoByte;
+    uint8_t   	  *byte;
+    int       	  byteCount, size;
+    
+    /* Interface resolutions */
+    struct sr_if *if_packet = 0;
+    
+    /* VR Host IP address and MAC address */
+    struct in_addr ip_vrhost;
+    unsigned char mac_vrhost[ETHER_ADDR_LEN];
+    
 
+    /* Resolve interfaces - where the packet is coming from */
+    if_packet = sr_get_interface(sr, interface);
+    sr_print_if(if_packet);   
+    
+    ip_vrhost.s_addr = if_packet->ip;
+    printf("\nvrhost IP address: %s", inet_ntoa(ip_vrhost));
+    
+    memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
+    printf("\nvrhost MAC address: ");
+    print_ethernet_address((uint8_t*)mac_vrhost);
+  
     errno = -1;
     switch(type)
     {
@@ -206,9 +263,26 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 				}
 					
 			    }
-			    errno = 0;
+			    errno = ERR_RSP_ARP_REP;
 			    break;
-	case ETHERTYPE_IP : break;
+	case ETHERTYPE_IP : 
+			    ip_hdr = (struct ip*)payload;
+			    byte = (uint8_t*)payload;
+			    twoByte = (unsigned int*)payload;
+			    
+			    /* Get IHL from the last four bits of the MSB */
+			    size = (*(byte) & 0x0f) << 2;
+
+			    /* Verify checksum */
+			    errno = verify_checksum(twoByte, size);
+			    if(!errno) 
+			    { errno = ERR_RSP_IP_CHKSUM; break; }
+
+			    /*Verify TTL validity */
+			    if(ip_hdr->ip_ttl >= 0)
+			    { errno = ERR_RSP_IP_TTL; break; }
+
+			    break;
 	default : errno = -1; break;
     }
 
@@ -231,11 +305,9 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
  * the method call.
  *
  * @addendum - @author Aditya Kousik
- * Yank the MAC addresses of the destination adn source, and type
- * and pass it along to sr_handle_ether_frame for type
+ * Yank the MAC addresses of the destination and source, and type
+ * and pass it along to sr_handle_ether_frame for further processing.
  *
- * \TODO Sender MAC Address is hard-coded for now.
- * Use resolve_ethernet_address for this.
  *---------------------------------------------------------------------*/
 
 void sr_handlepacket(struct sr_instance* sr, 
@@ -248,33 +320,22 @@ void sr_handlepacket(struct sr_instance* sr,
     assert(packet);
     assert(interface);
 
-    struct sr_instance *tmp;
-    struct sr_ethernet_hdr *ethernet_hdr  = 0;
-    struct sr_if *if_packet = 0;
-    
-    /* VR Host IP address and MAC address */
-    struct in_addr ip_vrhost;
-    unsigned char mac_vrhost[ETHER_ADDR_LEN];
-    
+    struct  sr_instance *tmp;
+    struct  sr_ethernet_hdr *ethernet_hdr  = 0;
     uint8_t dest_addr[ETHER_ADDR_LEN], src_addr[ETHER_ADDR_LEN], buf[ETHER_ADDR_LEN];
     uint8_t *payload = 0;    
-    
-    uint16_t type;
-    int errno, byteCount;
 
-    /* Resolve interfaces - where the packet is coming from */
-    if_packet = sr_get_interface(sr, interface);
-    sr_print_if(if_packet);   
-    
-    /* Set IP of vrhost to be visible globally */
-    ip_vrhost.s_addr = if_packet->ip;
-    printf("\nvrhost IP address: %s", inet_ntoa(ip_vrhost));
-    
-    memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
-    printf("\nvrhost MAC address: ");
-    print_ethernet_address((uint8_t*)mac_vrhost);
-    
+    /* Interface names. Keep a Copy of the old interface name. 
+     * Pass the newInterface to handle frame method. If it comes across
+     * an IP type packet, based on forwarding the interface name may get 
+     * changed. 
+     */
+
+    uint16_t type;
+    int errno, byteCount, result;
+   
     tmp = sr;
+
     printf("\n*** -> Received packet of length %d \n",len);
  
     // For Debugging. Print contents of packet before processing.
@@ -293,31 +354,86 @@ void sr_handlepacket(struct sr_instance* sr,
     type = ntohs(type);
     
     errno = sr_handle_ether_frame(dest_addr, src_addr, type, payload,
-				  ip_vrhost, mac_vrhost);
-    
-    /* The payload already has the ARP reply in it. 
-     * Swap the Source and Destination MAC address in the Ethernet header 
-     * and send it back along the receiving interface.
-    */
-    memcpy(buf, ethernet_hdr->ether_shost, ETHER_ADDR_LEN);
-    memcpy(ethernet_hdr->ether_shost,ethernet_hdr->ether_dhost, ETHER_ADDR_LEN);
-    memcpy(ethernet_hdr->ether_dhost, buf, ETHER_ADDR_LEN);
+   				  sr, interface);
+ 
+    /* Pass on what to do with the packet */
+    result = forward_packet(sr, ethernet_hdr, packet, len, interface, errno);
 
+}/* end sr_ForwardPacket */
+
+
+/*--------------------------------------------------------------------- 
+ * Method: forward_packet
+ * Scope:  Global
+ *
+ * Choose what to do with the packet based on the return value from 
+ * sr_handle_ethernet_frame
+ *
+ * @author : Aditya Kousik
+ * @date   : 25-09-2014
+ *
+ *---------------------------------------------------------------------*/
+int forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_hdr, 
+		   uint8_t* packet, unsigned int len, 
+		   char* interface, int errno)
+{
+
+    uint8_t 	  buf[ETHER_ADDR_LEN];
+    struct 	  sr_if *if_packet;
+    int 	  byteCount = 0, result = -1;
+    unsigned char mac_vrhost[ETHER_ADDR_LEN];
+
+    /* Resolve interfaces - where the packet is coming from */
+    if_packet = sr_get_interface(sr, interface);
+    memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
+
+   
+    /* Choose what to do with the packet */
+    switch(errno)
+    {
+	case ERR_RSP_ARP_REQ: 
+			      result = 0;
+			      break;
+
+	case ERR_RSP_ARP_REP: 
+			      /* The payload already has the ARP reply in it. 
+			       * Swap the Source and Destination MAC address in the Ethernet header 
+			       * and send it back along the receiving interface.
+			       */
+ 
+			      memcpy(buf, ethernet_hdr->ether_shost, ETHER_ADDR_LEN);
+			      memcpy(ethernet_hdr->ether_shost,ethernet_hdr->ether_dhost, ETHER_ADDR_LEN);
+			      memcpy(ethernet_hdr->ether_dhost, buf, ETHER_ADDR_LEN);  
+
+			      result = 0;
+			      break;
+
+	default		    : break;
+    }
+    /* Slapping the MAC address of the host - this is fixed 
+     * Do this at the last, because swapping shost and dhost 
+     * will overwrite the shost value.
+     */
     /* Conversion of unsigned char to uint8_t seems to be er.... "pita"  */
+
     byteCount = 0;
     while(byteCount < ETHER_ADDR_LEN) 
     {
 	ethernet_hdr->ether_shost[byteCount] = *(uint8_t*)(&mac_vrhost[byteCount]);
 	byteCount++;
     }
-
+ 
     /* For Debugging. Printing contents of packet just before sending it back */
-    sr_print_packet_contents(tmp, packet, len, interface);
+    sr_print_packet_contents(sr, packet, len, interface);
 
+  
     /*Packet is ready and valid. Send it */
-    sr_send_packet(sr, packet, len, interface);
-
-}/* end sr_ForwardPacket */
+    if(!result)
+    {
+	sr_send_packet(sr, packet, len, interface);
+    }
+    return(result);
+}
 
 /*--------------------------------------------------------------------- 
  * Method: print_ethernet_address
