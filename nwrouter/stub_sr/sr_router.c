@@ -35,8 +35,6 @@ struct sr_arp_cache *arp_cache_root = NULL;
  *
  * Initialize the routing subsystem
  *
- * Sets global variables - vrhost IP address and MAC address 
- *
  *---------------------------------------------------------------------*/
 
 void sr_init(struct sr_instance* sr) 
@@ -60,6 +58,7 @@ void sr_init(struct sr_instance* sr)
 void print_arp_cache()
 {
     struct sr_arp_cache *cur = arp_cache_root;
+    printf("\nProtocol Type IP address \tMAC address");
     while(cur->next != NULL)
     {
 	printf("\n%u %x ", ntohs(cur->arp_type), ntohl(cur->arp_sip)); 
@@ -118,10 +117,12 @@ void add_arp_cache_tuple(struct sr_arp_cache *tuple)
 
 int walk_arp_cache(struct sr_arp_cache *tuple)
 {
-    int fail = 0;
+    int retval = 0;
     struct sr_arp_cache *cur;
-    if(arp_cache_root == NULL) return fail;
+
+    if(arp_cache_root == NULL) return retval;
     cur = arp_cache_root;
+
     while(cur->next)
     {
 	if(cur->arp_type == tuple->arp_type && cur->arp_sip == tuple->arp_sip)
@@ -129,12 +130,49 @@ int walk_arp_cache(struct sr_arp_cache *tuple)
 	    /*There is a <proto_type,sender_address> present. 
 	     *Let's update its hw_addr */
 	    memcpy(cur->arp_sha, tuple->arp_sha,ETHER_ADDR_LEN);
-	    return ++fail;
+	    return ++retval;
 	}
 	cur = cur->next;
     }
-    return fail;
+    return retval;
 }
+
+/*--------------------------------------------------------------------- 
+ * Method: sr_lookup_arp_cache
+ * Scope:  Local
+ *
+ * Walk the ARP cache to search for <dest_address, hw_addr> entries
+ * Returns the MAC address if found. NULL otherwise.
+ * 
+ * @author : Aditya Kousik
+ * @date   : 23-09-2014
+ *
+ *---------------------------------------------------------------------*/
+
+int sr_lookup_arp_cache(unsigned char *buf, struct in_addr ip)
+{
+    int retval = -1;
+    struct sr_arp_cache *cur;
+
+    if(arp_cache_root == NULL) retval = -1;
+    cur = arp_cache_root;
+
+    while(cur->next)
+    {
+	if(ntohl(cur->arp_sip) == ip.s_addr)
+	{
+	    /* Assuming that if there is an IP entry, it is also 
+	     * accompanied by the MAC address; the ARP cache was
+	     * constructed in this way: as <IP,MAC> pairs */
+
+	    buf = cur->arp_sha; 
+	    retval = 0;
+	}
+	cur = cur->next;
+    }
+    return retval;
+}
+
 
 /*--------------------------------------------------------------------- 
  * Method: verify_checksum
@@ -195,15 +233,14 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
     struct 	  sr_arphdr *arp_hdr;
     struct 	  sr_arp_cache cur;
     unsigned char buf[ETHER_ADDR_LEN];
-    struct sr_rt* rt_entry;    
-    unsigned long errno;
+    unsigned long err_rsp_no;
 
     /* IP declarations */
     uint32_t      ipbuf;
     struct ip     *ip_hdr;
+    uint8_t	  *byte;
     uint16_t      *twoByte;
-    uint8_t   	  *byte;
-    int       	  byteCount, size;
+    int       	  byteCount, size, retval;
     
     /* Interface resolutions */
     struct sr_if *if_packet = 0;
@@ -223,7 +260,7 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
     printf("\nvrhost MAC address: ");
     print_ethernet_address((uint8_t*)mac_vrhost);
   
-    errno = -1;
+    err_rsp_no = -1;
     switch(type)
     {
 	case ETHERTYPE_ARP: 
@@ -231,6 +268,7 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 			    cur.arp_type = arp_hdr->ar_pro; cur.arp_sip = htonl(arp_hdr->ar_sip);
 			    memcpy(cur.arp_sha, arp_hdr->ar_sha, ETHER_ADDR_LEN);
 			    merge_flag = walk_arp_cache(&cur);
+
 			    //If the target IP is really mine
 			    ips_are_same = arp_hdr->ar_tip == *((uint32_t*)&(ip_vrhost));
 			    if(ips_are_same)
@@ -255,10 +293,14 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 				    ipbuf = arp_hdr->ar_sip;
 				    arp_hdr->ar_sip = arp_hdr->ar_tip;
 				    arp_hdr->ar_tip = ipbuf;			    
+				
+				    /* Issue a send_REPLY  */
+				    err_rsp_no = ERR_RSP_ARP_REP;
 				}
+				/* Do nothing with the REPLY packet. Drop it  */
+				else err_rsp_no = ERR_RSP_ARP_NIL;
 					
 			    }
-			    errno = ERR_RSP_ARP_REP;
 			    break;
 	case ETHERTYPE_IP : 
 			    ip_hdr = (struct ip*)payload;
@@ -267,23 +309,51 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 			    
 			    /* Get IHL from the last four bits of the MSB */
 			    size = (*(byte) & 0x0f) << 2;
+			    /* Use of byte is over. Let's use it for
+			     * receiving the MAC address from the ARP lookup */
 
 			    /* Verify checksum */
-			    errno = verify_checksum(twoByte, size);
-			    if(errno) 
-			    { errno = ERR_RSP_IP_CHKSUM;  break; }
+			    err_rsp_no = verify_checksum(twoByte, size);
+			    if(err_rsp_no) 
+			    { err_rsp_no = ERR_RSP_IP_CHKSUM;  break; }
 
-			    /*Verify TTL validity */
-			    if(ip_hdr->ip_ttl <= 0)
-			    { errno = ERR_RSP_IP_TTL; break; }
+			    /* Verify TTL validity and decrement only if packet is
+			     * not addressed to this machine's IP */
+			    if(ip_hdr->ip_dst.s_addr != ip_vrhost.s_addr)
+			    {
+			        if(ip_hdr->ip_ttl <= 0)
+			        { err_rsp_no = ERR_RSP_IP_TTL; break; }
+				    else ip_hdr->ip_ttl--;
+			    }
 
-			    rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst);
-			    
+			    /* Check the ARP cache for MAC address */
+			    print_arp_cache();
+			    retval = sr_lookup_arp_cache(&buf, ip_hdr->ip_dst);
+
+			    /* Found the MAC address. Set it to the ethernet 
+			     * header dhost */
+			    if(!retval)
+			    {
+				printf("\nARPhit");
+				err_rsp_no = ERR_RSP_IP_FWD;
+			        byteCount = 0;
+				while(byteCount < ETHER_ADDR_LEN)
+				{
+				    dhost[byteCount] = *(uint8_t*)&buf[byteCount];
+				    byteCount++;
+				}
+			    }
+			    // ARP cache miss. Set up an ARP REQUEST packet.
+			    else 
+			        { err_rsp_no = ERR_RSP_ARP_REQ; printf("\nARPmiss"); break; }
+
+			    /* The code would have broken if it hasn't reached this
+			     * point. So let's compute the checksum */
 			    break;
-	default : errno = -1; break;
+	default : err_rsp_no = -1; break;
     }
 
-    return(errno);
+    return(err_rsp_no);
 }	
 
 
@@ -322,8 +392,9 @@ void sr_handlepacket(struct sr_instance* sr,
     uint8_t dest_addr[ETHER_ADDR_LEN], src_addr[ETHER_ADDR_LEN], buf[ETHER_ADDR_LEN];
     uint8_t *payload = 0;    
     uint16_t type;
-    int errno, byteCount, result;
-   
+    int err_rsp_no, byteCount, result;
+    struct sr_if *if_packet = 0;   
+
     tmp = sr;
 
     printf("\n*** -> Received packet of length %d \n",len);
@@ -343,11 +414,11 @@ void sr_handlepacket(struct sr_instance* sr,
     type = ethernet_hdr->ether_type;
     type = ntohs(type);
     
-    errno = sr_handle_ether_frame(dest_addr, src_addr, type, payload,
+    err_rsp_no = sr_handle_ether_frame(dest_addr, src_addr, type, payload,
    				  sr, interface);
- 
+    
     /* Pass on what to do with the packet */
-    result = sr_forward_packet(sr, ethernet_hdr, packet, len, interface, errno);
+    result = sr_forward_packet(sr, ethernet_hdr, packet, len, interface, err_rsp_no);
 
 }/* end sr_ForwardPacket */
 
@@ -423,6 +494,59 @@ struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
 }
 
 /*--------------------------------------------------------------------- 
+ * Method: sr_construct_packet
+ * Scope:  Global
+ *
+ * Create a new packet - ARP REQ (or in future, new ICMP types?)
+ *
+ * @author : Aditya Kousik
+ * @date   : 26-09-2014
+ *
+ *---------------------------------------------------------------------*/
+uint8_t* sr_construct_new_packet(unsigned char mac_vrhost[ETHER_ADDR_LEN],
+				 uint32_t sip, uint32_t tip, int err_rsp_no)
+{
+    int byteCount;
+    uint8_t *buf = 0, bufMAC[ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    struct sr_ethernet_hdr *ethernet_hdr = 0;
+    struct sr_arphdr *arp_hdr = 0;
+    unsigned char tmp[ETHER_ADDR_LEN] = {0};
+
+    printf("\nsr_forward:Sender IP: %x", sip);
+    printf("\nDest IP: %x", tip);
+
+    buf = (uint8_t*)malloc(sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr));
+    ethernet_hdr = (struct sr_ethernet_hdr*) buf;
+    switch(err_rsp_no)
+    {
+	case ERR_RSP_ARP_REQ:
+		 	      arp_hdr = (struct sr_arphdr*) (buf + sizeof(struct sr_ethernet_hdr));
+			      arp_hdr->ar_hrd = htons(ARPHDR_ETHER);
+			      arp_hdr->ar_pro = htons(ETHERTYPE_IP);
+			      arp_hdr->ar_hln = ETHER_ADDR_LEN;
+			      arp_hdr->ar_pln = IP_ADDR_LEN;
+			      arp_hdr->ar_op  = htons(ARP_REQUEST);
+			      memcpy(arp_hdr->ar_sha, mac_vrhost, ETHER_ADDR_LEN);
+			      arp_hdr->ar_sip = sip;
+			      memcpy(arp_hdr->ar_tha, tmp, ETHER_ADDR_LEN);
+			      arp_hdr->ar_tip = tip;
+			      break;
+    }
+
+    /* Payload fixed. Now add Ethernet header fields */
+    memcpy(ethernet_hdr->ether_dhost, bufMAC, ETHER_ADDR_LEN);  
+    byteCount = 0;
+    while(byteCount < ETHER_ADDR_LEN) 
+    {
+	ethernet_hdr->ether_shost[byteCount] = *(uint8_t*)(&mac_vrhost[byteCount]);
+	byteCount++;
+    }
+    ethernet_hdr->ether_type = htons(ETHERTYPE_ARP);
+  
+    return buf;
+}
+
+/*--------------------------------------------------------------------- 
  * Method: sr_forward_packet
  * Scope:  Global
  *
@@ -435,23 +559,45 @@ struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
  *---------------------------------------------------------------------*/
 int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_hdr, 
 		   uint8_t* packet, unsigned int len, 
-		   char* interface, int errno)
+		   char* interface, int err_rsp_no)
 {
 
-    uint8_t 	  buf[ETHER_ADDR_LEN];
+    uint8_t 	  buf[ETHER_ADDR_LEN], *newPacket = 0;
     struct 	  sr_if *if_packet;
     int 	  byteCount = 0, result = -1;
     unsigned char mac_vrhost[ETHER_ADDR_LEN];
+    struct sr_rt* rt_entry;    
+    uint32_t	  ip_vrhost;
+    struct ip*    ip_hdr;
 
-    /* Resolve interfaces - where the packet is coming from */
+    /* Could still be the old packet */
+    newPacket = packet; 
+
+    /* Route only if IP packet */
+    if(ntohs(ethernet_hdr->ether_type) == ETHERTYPE_IP)
+    {
+	ip_hdr = (struct ip*) (packet + sizeof(struct sr_ethernet_hdr));
+   
+        /* Routing is done here. At the network level */
+    	rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst);
+    
+    	/* Set the new interface. This holds for ICMP too */
+    	interface = &(rt_entry->interface);
+    }
+    /* Resolve interfaces - where the packet is going to */    
     if_packet = sr_get_interface(sr, interface);
     memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
+    ip_vrhost = if_packet->ip;
 
-   
     /* Choose what to do with the packet */
-    switch(errno)
+
+    switch(err_rsp_no)
     {
 	case ERR_RSP_ARP_REQ: 
+			      newPacket = sr_construct_new_packet(mac_vrhost, ip_vrhost, 
+								  ip_hdr->ip_dst.s_addr, ERR_RSP_ARP_REQ); 
+			      /* ARP packet. There's only gonna be eth_hdr and arp_hdr  */
+			      len = sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
 			      result = 0;
 			      break;
 
@@ -470,6 +616,7 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 
 	default		    : break;
     }
+
     /* Slapping the MAC address of the host - this is fixed 
      * Do this at the last, because swapping shost and dhost 
      * will overwrite the shost value.
@@ -484,13 +631,13 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
     }
  
     /* For Debugging. Printing contents of packet just before sending it */
-    sr_print_packet_contents(sr, packet, len, interface);
+    sr_print_packet_contents(sr, newPacket, len, interface);
 
   
     /*Packet is ready and valid. Send it */
     if(!result)
     {
-	sr_send_packet(sr, packet, len, interface);
+	sr_send_packet(sr, newPacket, len, interface);
     }
     return(result);
 }
@@ -537,13 +684,12 @@ void sr_print_packet_contents(struct sr_instance* sr,
 {
     struct sr_ethernet_hdr *ethernet_hdr  = 0;
     struct sr_arphdr *arp_hdr = 0;
-
+    struct ip *ip_hdr = 0;
     assert(sr);
 
    
     /*  Begin traversing the packet list */
     ethernet_hdr = (struct sr_ethernet_hdr *)packet;
-    arp_hdr = (struct sr_arphdr *)(packet + sizeof(struct sr_ethernet_hdr));
 
     printf("\n\n------Ethernet frame begins--------");
     
@@ -557,10 +703,12 @@ void sr_print_packet_contents(struct sr_instance* sr,
 
     if(ntohs(ethernet_hdr->ether_type) == ETHERTYPE_ARP)
     {
+        arp_hdr = (struct sr_arphdr *)(packet + sizeof(struct sr_ethernet_hdr));
     	printf("\n\n------------ARP header--------------");
     	printf("\nHw addr format: %x\t Protocol addr format: %x\t ARP opcode: %x\t", 
         ntohs(arp_hdr->ar_hrd), ntohs(arp_hdr->ar_pro), ntohs(arp_hdr->ar_op));
-
+    	printf("\nHw addr length: %x\t Protocol addr length: %x\t", 
+        arp_hdr->ar_hln, arp_hdr->ar_pln);
 	printf("\nSender hardware address: ");
 	print_ethernet_address((uint8_t*)&arp_hdr->ar_sha);
 	printf("\tSender IP address: %s\t", inet_ntoa(*(struct in_addr*)&arp_hdr->ar_sip));
@@ -569,5 +717,14 @@ void sr_print_packet_contents(struct sr_instance* sr,
 	printf("\tDestination IP address: %s\t", inet_ntoa(*(struct in_addr*)&arp_hdr->ar_tip));
 	printf("\n---------End of ARP header-----------\n");
     } 	
-    
+    else if(ntohs(ethernet_hdr->ether_type) == ETHERTYPE_IP)
+    {
+	ip_hdr = (struct ip*) (packet + sizeof(struct sr_ethernet_hdr));
+    	printf("\n\n------------IP header--------------");
+	printf("\nTime to live : %d \tProtocol type : %x \t Checksum : %x \n", ip_hdr->ip_ttl,
+		ip_hdr->ip_p, ip_hdr->ip_sum);
+	printf("Sender IP address: %s\t", inet_ntoa(ip_hdr->ip_src));
+	printf("Destination IP address: %s\t", inet_ntoa(ip_hdr->ip_dst));
+	printf("\n---------End of IP header-----------\n");
+    }
 }

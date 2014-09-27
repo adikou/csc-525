@@ -33,13 +33,13 @@
 #define PACKET_DUMP_SIZE 1024
 
 /* #defines for standard error handling and response values */
-#define ERR_RSP_ERR       0
+#define ERR_RSP_ARP_NIL   0
 #define ERR_RSP_ARP_REQ   1
 #define ERR_RSP_ARP_REP   2
 #define ERR_RSP_IP_CHKSUM 3
 #define ERR_RSP_IP_TTL	  4  
-#define ERR_RSP_IP_FWD	  5
-#define ERR_RSP_ICMP      6
+#define ERR_RSP_IP_FWD	  6
+#define ERR_RSP_ICMP      7
 
 /* forward declare */
 struct sr_if;
@@ -88,6 +88,7 @@ int  verify_checksum(uint16_t *, int);
 int  sr_forward_packet(struct sr_instance*, struct sr_ethernet_hdr*,
 		    uint8_t*, unsigned int, char*, int);
 struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance*, struct in_addr);
+int sr_lookup_arp_cache(unsigned char*, struct in_addr ip);
 
 
 /* -- sr_if.c -- */
