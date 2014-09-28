@@ -21,9 +21,11 @@
 #include "sr_rt.h"
 #include "sr_router.h"
 #include "sr_protocol.h"
-//Added ARP cache include - AK
-#include "sr_arp_cache.h"
 
+/* Local includes  */
+#include "sr_arp_cache.h"
+#include "sr_err_rsp.h"
+#include "sr_fwd_ref.h"
 
 /*Initialise an empty ARP cache */
 struct sr_arp_cache *arp_cache_root = NULL; 
@@ -81,7 +83,6 @@ void print_arp_cache()
 
 void add_arp_cache_tuple(struct sr_arp_cache *tuple)
 {
-    int fail = 0;
     struct sr_arp_cache *cur, *new;
     cur = arp_cache_root; 
     
@@ -164,8 +165,7 @@ int sr_lookup_arp_cache(unsigned char *buf, struct in_addr ip)
 	    /* Assuming that if there is an IP entry, it is also 
 	     * accompanied by the MAC address; the ARP cache was
 	     * constructed in this way: as <IP,MAC> pairs */
-
-	    buf = cur->arp_sha; 
+	    memcpy(buf, cur->arp_sha, sizeof(unsigned char) * ETHER_ADDR_LEN);  
 	    retval = 0;
 	}
 	cur = cur->next;
@@ -173,6 +173,46 @@ int sr_lookup_arp_cache(unsigned char *buf, struct in_addr ip)
     return retval;
 }
 
+/*--------------------------------------------------------------------- 
+ * Method: compute_checksum
+ * Scope:  Local
+ *
+ * Computer checksum of the IP header.
+ *
+ * @author : Aditya Kousik
+ * @date   : 27-09-2014
+ *
+ *---------------------------------------------------------------------*/
+
+int compute_checksum (uint16_t *twoByte, int size)
+{
+    int twoByteCount = 1;
+    unsigned long sum = 0;
+    int retval = 0, tmp;
+
+    while(twoByteCount <= size/2)
+    {
+
+	if(twoByteCount != 6 )
+	{
+
+	    printf("\n%x %x", sum, *twoByte);
+	    tmp = *twoByte++;
+	    sum += ntohs(tmp);
+	}
+	/* Skip the checksum octet */
+	else *twoByte++;	
+	/* Carry occurred */
+	if(sum & 0xffff0000)
+	{
+	    sum &= 0xffff; 
+	    sum++;
+	}
+	twoByteCount++;	
+    }
+    retval = sum;
+    return((uint16_t)(~retval));
+}
 
 /*--------------------------------------------------------------------- 
  * Method: verify_checksum
@@ -223,7 +263,8 @@ int verify_checksum (uint16_t *twoByte, int size)
  *
  *---------------------------------------------------------------------*/
 
-int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost, 
+int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN], 
+			  uint8_t shost[ETHER_ADDR_LEN], 
 			  uint16_t type, uint8_t* payload, 
 			  struct sr_instance* sr, char* interface) 
 {
@@ -234,6 +275,7 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
     struct 	  sr_arp_cache cur;
     unsigned char buf[ETHER_ADDR_LEN];
     unsigned long err_rsp_no;
+    struct sr_rt* routing_entry = 0;
 
     /* IP declarations */
     uint32_t      ipbuf;
@@ -328,8 +370,8 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 
 			    /* Check the ARP cache for MAC address */
 			    print_arp_cache();
-			    retval = sr_lookup_arp_cache(&buf, ip_hdr->ip_dst);
-
+			    retval = sr_lookup_arp_cache(buf, ip_hdr->ip_dst);
+			    print_ethernet_address((uint8_t*)buf);
 			    /* Found the MAC address. Set it to the ethernet 
 			     * header dhost */
 			    if(!retval)
@@ -337,18 +379,48 @@ int sr_handle_ether_frame(uint8_t* dhost, uint8_t* shost,
 				printf("\nARPhit");
 				err_rsp_no = ERR_RSP_IP_FWD;
 			        byteCount = 0;
-				while(byteCount < ETHER_ADDR_LEN)
-				{
-				    dhost[byteCount] = *(uint8_t*)&buf[byteCount];
+			        while(byteCount < ETHER_ADDR_LEN) 
+			        {
+				    dhost[byteCount] = (uint8_t)(buf[byteCount]);
 				    byteCount++;
-				}
+			        }
+				//print_ethernet_address(dhost);
 			    }
-			    // ARP cache miss. Set up an ARP REQUEST packet.
+			    // ARP cache miss.
 			    else 
-			        { err_rsp_no = ERR_RSP_ARP_REQ; printf("\nARPmiss"); break; }
+		            {
+				 routing_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst);
+
+				 /* ZERO! Default gateway. We know where it is.
+				  * Just foward it. Do this by performing an ARP table lookup
+				  * on the gw field of RTable entry. That will definitely 
+				  * generate a hit (NOTE: We are not going to delete the
+				  * default gw MAC address). Otherwise, the target IP is somewhere
+				  * in our subnets. THEN issue an ARP REQ */
+				 if(routing_entry == sr->routing_table)
+				 {
+				     printf("\nDefault Gateway hit!");
+				     retval = sr_lookup_arp_cache(buf, routing_entry->gw);
+				     byteCount = 0;
+			             while(byteCount < ETHER_ADDR_LEN) 
+			             {
+				         dhost[byteCount] = (uint8_t)(buf[byteCount]);
+				         byteCount++;
+			             } 
+				     err_rsp_no = ERR_RSP_IP_FWD;
+				 }
+				 else
+				 {
+					 err_rsp_no = ERR_RSP_ARP_REQ; printf("\nARPmiss"); 
+				 	 break; 
+				 }
+			    }
 
 			    /* The code would have broken if it hasn't reached this
-			     * point. So let's compute the checksum */
+			     * point. So let's compute the checksum and store it 
+			     * at offset of 10 bytes */
+			    retval = compute_checksum(twoByte, size);
+			    ip_hdr->ip_sum = htons(retval);
 			    break;
 	default : err_rsp_no = -1; break;
     }
@@ -389,11 +461,9 @@ void sr_handlepacket(struct sr_instance* sr,
 
     struct  sr_instance *tmp;
     struct  sr_ethernet_hdr *ethernet_hdr  = 0;
-    uint8_t dest_addr[ETHER_ADDR_LEN], src_addr[ETHER_ADDR_LEN], buf[ETHER_ADDR_LEN];
     uint8_t *payload = 0;    
     uint16_t type;
-    int err_rsp_no, byteCount, result;
-    struct sr_if *if_packet = 0;   
+    int err_rsp_no, result;
 
     tmp = sr;
 
@@ -407,15 +477,13 @@ void sr_handlepacket(struct sr_instance* sr,
     payload = (uint8_t *) (packet + sizeof(struct sr_ethernet_hdr));
 
     //Clear the memory - causing too much segfaults
-    memset((void*)&dest_addr, 0, sizeof(uint8_t));
-    memcpy(dest_addr, ethernet_hdr->ether_dhost, ETHER_ADDR_LEN);
-    memset((void*)&src_addr, 0, sizeof(uint8_t));
-    memcpy(src_addr, ethernet_hdr->ether_shost, ETHER_ADDR_LEN);
     type = ethernet_hdr->ether_type;
     type = ntohs(type);
-    
-    err_rsp_no = sr_handle_ether_frame(dest_addr, src_addr, type, payload,
-   				  sr, interface);
+ 
+    err_rsp_no = sr_handle_ether_frame(ethernet_hdr->ether_dhost, 
+				       ethernet_hdr->ether_shost, 
+				       type, payload,
+   				       sr, interface);
     
     /* Pass on what to do with the packet */
     result = sr_forward_packet(sr, ethernet_hdr, packet, len, interface, err_rsp_no);
@@ -460,8 +528,8 @@ struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
 				      struct in_addr ip)
 {
     struct sr_rt *rtable_entry = 0, *greatest_match = 0;
-    uint32_t buf = 0, leastXOR = 0;
-    int bitCount, numBits;
+    uint32_t buf = 0;
+    int numBits;
     
     rtable_entry = sr->routing_table;
     if(rtable_entry == 0) return(0);
@@ -474,18 +542,16 @@ struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
 	/* Truncate that many number of bits, because we don't need them */
 	buf = ntohl(rtable_entry->dest.s_addr) >> numBits;
 
-	/* XOR the entire value with the ip address  */
-	buf = buf ^ (ntohl(ip.s_addr) >> numBits);
-
-	if(greatest_match == NULL)
+	/* Sub the entire value with the ip address  */
+	buf = buf - (ntohl(ip.s_addr) >> numBits);
+	
+	if(greatest_match == 0)
 	{
-	    leastXOR = buf;
 	    greatest_match = rtable_entry;
 	}
-	    else if(buf < leastXOR) 
+	    else if(buf == 0) 
 	    {
 		greatest_match = rtable_entry;
-		leastXOR = buf;
 	    }
 
 	rtable_entry = rtable_entry->next;
@@ -511,9 +577,6 @@ uint8_t* sr_construct_new_packet(unsigned char mac_vrhost[ETHER_ADDR_LEN],
     struct sr_ethernet_hdr *ethernet_hdr = 0;
     struct sr_arphdr *arp_hdr = 0;
     unsigned char tmp[ETHER_ADDR_LEN] = {0};
-
-    printf("\nsr_forward:Sender IP: %x", sip);
-    printf("\nDest IP: %x", tip);
 
     buf = (uint8_t*)malloc(sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr));
     ethernet_hdr = (struct sr_ethernet_hdr*) buf;
@@ -613,6 +676,13 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 
 			      result = 0;
 			      break;
+	case ERR_RSP_IP_FWD: 
+			       /* ARP cache hit has occurred. The dhost is already  
+			       * and send it along the right interface.
+			       */
+			      result = 0;
+			      break;
+
 
 	default		    : break;
     }
@@ -629,7 +699,8 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 	ethernet_hdr->ether_shost[byteCount] = *(uint8_t*)(&mac_vrhost[byteCount]);
 	byteCount++;
     }
- 
+
+    printf("\nRight before send:%d %s", result, interface); 
     /* For Debugging. Printing contents of packet just before sending it */
     sr_print_packet_contents(sr, newPacket, len, interface);
 

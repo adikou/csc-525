@@ -78,7 +78,6 @@
 /*
  * Structure of an internet header, naked of options.
  */
-#define IP_ADDR_LEN 4
 struct ip
   {
 #if __BYTE_ORDER == __LITTLE_ENDIAN

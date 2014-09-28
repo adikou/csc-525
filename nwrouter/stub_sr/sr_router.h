@@ -32,15 +32,6 @@
 #define INIT_TTL 255
 #define PACKET_DUMP_SIZE 1024
 
-/* #defines for standard error handling and response values */
-#define ERR_RSP_ARP_NIL   0
-#define ERR_RSP_ARP_REQ   1
-#define ERR_RSP_ARP_REP   2
-#define ERR_RSP_IP_CHKSUM 3
-#define ERR_RSP_IP_TTL	  4  
-#define ERR_RSP_IP_FWD	  6
-#define ERR_RSP_ICMP      7
-
 /* forward declare */
 struct sr_if;
 struct sr_rt;
@@ -80,15 +71,6 @@ int sr_read_from_server(struct sr_instance* );
 /* -- sr_router.c -- */
 void sr_init(struct sr_instance* );
 void sr_handlepacket(struct sr_instance* , uint8_t * , unsigned int , char* );
-
-/* Adding custom function prototypes -AK */
-void sr_print_packet_contents(struct sr_instance*, uint8_t*, unsigned int , char*);
-void print_ethernet_address(uint8_t *);
-int  verify_checksum(uint16_t *, int);
-int  sr_forward_packet(struct sr_instance*, struct sr_ethernet_hdr*,
-		    uint8_t*, unsigned int, char*, int);
-struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance*, struct in_addr);
-int sr_lookup_arp_cache(unsigned char*, struct in_addr ip);
 
 
 /* -- sr_if.c -- */
