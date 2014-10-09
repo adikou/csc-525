@@ -26,10 +26,16 @@
 #include "sr_arp_cache.h"
 #include "sr_err_rsp.h"
 #include "sr_fwd_ref.h"
+#include "sr_packet_queue.h"
+
+/* Number of packets_queued */
+int PACKETS_QUEUED = 0;
 
 /*Initialise an empty ARP cache */
 struct sr_arp_cache *arp_cache_root = NULL; 
 
+/* Initialise empty packet queue  */
+struct sr_packet_queue *queue_head = NULL;
 
 /*--------------------------------------------------------------------- 
  * Method: sr_init(void)
@@ -60,13 +66,16 @@ void sr_init(struct sr_instance* sr)
 void print_arp_cache()
 {
     struct sr_arp_cache *cur = arp_cache_root;
-    printf("\nProtocol Type IP address \tMAC address");
-    while(cur->next != NULL)
+    struct in_addr ip;
+    printf("\nProtocol Type\tIP address \tMAC address");
+    while(cur != NULL)
     {
-	printf("\n%u %x ", ntohs(cur->arp_type), ntohl(cur->arp_sip)); 
+	ip.s_addr = ntohl(cur->arp_sip);
+	printf("\n%x\t\t", ntohs(cur->arp_type));
+	printf("%s\t\t", inet_ntoa(ip));
 	print_ethernet_address(cur->arp_sha);
 	cur = cur->next;
-    }
+   }
 }
 
 /*--------------------------------------------------------------------- 
@@ -84,24 +93,22 @@ void print_arp_cache()
 void add_arp_cache_tuple(struct sr_arp_cache *tuple)
 {
     struct sr_arp_cache *cur, *new;
-    cur = arp_cache_root; 
     
     new = (struct sr_arp_cache*)malloc(sizeof(struct sr_arp_cache));
     new->arp_type = tuple->arp_type; new->arp_sip = tuple->arp_sip;
     memcpy(new->arp_sha, tuple->arp_sha, ETHER_ADDR_LEN);
-    new->next = NULL; 
-
+    new->next = NULL;
+    
     if(arp_cache_root == NULL)
     { 
 	arp_cache_root = new;
-	arp_cache_root->next = NULL;
     }
-	else
-	{	    
-	    while(cur->next !=NULL) { cur = cur->next; } 
-	    new->next = NULL;
+    else
+    {		    
+    	    cur = arp_cache_root; 
+	    while(cur->next != NULL) { cur = cur->next; } 
 	    cur->next = new;
-	}
+    }
         
 }
 
@@ -124,7 +131,7 @@ int walk_arp_cache(struct sr_arp_cache *tuple)
     if(arp_cache_root == NULL) return retval;
     cur = arp_cache_root;
 
-    while(cur->next)
+    while(cur != NULL)
     {
 	if(cur->arp_type == tuple->arp_type && cur->arp_sip == tuple->arp_sip)
 	{
@@ -158,7 +165,7 @@ int sr_lookup_arp_cache(unsigned char *buf, struct in_addr ip)
     if(arp_cache_root == NULL) retval = -1;
     cur = arp_cache_root;
 
-    while(cur->next)
+    while(cur != NULL)
     {
 	if(ntohl(cur->arp_sip) == ip.s_addr)
 	{
@@ -195,8 +202,6 @@ int compute_checksum (uint16_t *twoByte, int size)
 
 	if(twoByteCount != 6 )
 	{
-
-	    printf("\n%x %x", sum, *twoByte);
 	    tmp = *twoByte++;
 	    sum += ntohs(tmp);
 	}
@@ -310,13 +315,18 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 			    cur.arp_type = arp_hdr->ar_pro; cur.arp_sip = htonl(arp_hdr->ar_sip);
 			    memcpy(cur.arp_sha, arp_hdr->ar_sha, ETHER_ADDR_LEN);
 			    merge_flag = walk_arp_cache(&cur);
+			    printf("\nMerge flag :: %d", merge_flag);
+
 
 			    //If the target IP is really mine
 			    ips_are_same = arp_hdr->ar_tip == *((uint32_t*)&(ip_vrhost));
 			    if(ips_are_same)
 			    {
 				if(merge_flag == 0)
+				{
 				    add_arp_cache_tuple(&cur);
+				    print_arp_cache();
+				}
 				//else print_arp_cache();
 				if(ntohs(arp_hdr->ar_op) == ARP_REQUEST)
 				{
@@ -340,7 +350,13 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 				    err_rsp_no = ERR_RSP_ARP_REP;
 				}
 				/* Do nothing with the REPLY packet. Drop it  */
-				else err_rsp_no = ERR_RSP_ARP_NIL;
+				else
+				{
+				    printf("\nARP REPLY: PRINT ARP CACHE NOW");
+				    print_arp_cache();
+				    _dump_pending_packets(arp_hdr->ar_sip);
+				    err_rsp_no = ERR_RSP_ARP_NIL;
+				}
 					
 			    }
 			    break;
@@ -371,7 +387,7 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 			    /* Check the ARP cache for MAC address */
 			    print_arp_cache();
 			    retval = sr_lookup_arp_cache(buf, ip_hdr->ip_dst);
-			    print_ethernet_address((uint8_t*)buf);
+			    printf("\n");print_ethernet_address((uint8_t*)buf);
 			    /* Found the MAC address. Set it to the ethernet 
 			     * header dhost */
 			    if(!retval)
@@ -397,22 +413,28 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 				  * generate a hit (NOTE: We are not going to delete the
 				  * default gw MAC address). Otherwise, the target IP is somewhere
 				  * in our subnets. THEN issue an ARP REQ */
-				 if(routing_entry == sr->routing_table)
+				 if(routing_entry->dest.s_addr == 0)
 				 {
 				     printf("\nDefault Gateway hit!");
 				     retval = sr_lookup_arp_cache(buf, routing_entry->gw);
-				     byteCount = 0;
-			             while(byteCount < ETHER_ADDR_LEN) 
-			             {
-				         dhost[byteCount] = (uint8_t)(buf[byteCount]);
-				         byteCount++;
-			             } 
-				     err_rsp_no = ERR_RSP_IP_FWD;
+				     /* We've assumed that the gateway MAC address is always in
+				      * the ARP cache, which is wrong. Check if ARP cache is a hit
+				      * and only then set it as ERR_RSP_IP_FWD */ 
+				     if(!retval)
+				     {
+				     	byteCount = 0;
+			             	while(byteCount < ETHER_ADDR_LEN) 
+			             	{
+				            dhost[byteCount] = (uint8_t)(buf[byteCount]);
+				            byteCount++;
+			             	} 
+				     	err_rsp_no = ERR_RSP_IP_FWD;
+				     }
+				     else err_rsp_no = ERR_RSP_ARP_REQ_GWAY;
 				 }
 				 else
 				 {
-					 err_rsp_no = ERR_RSP_ARP_REQ; printf("\nARPmiss"); 
-				 	 break; 
+					 err_rsp_no = ERR_RSP_ARP_REQ_SNET; printf("\nARPmiss"); 
 				 }
 			    }
 
@@ -489,6 +511,158 @@ void sr_handlepacket(struct sr_instance* sr,
     result = sr_forward_packet(sr, ethernet_hdr, packet, len, interface, err_rsp_no);
 
 }/* end sr_ForwardPacket */
+
+/*--------------------------------------------------------------------- 
+ * Method: _dump_pending_packets
+ * Scope:  Local
+ *
+ * Flush pending packets to the network.
+ *
+ * @author : Aditya Kousik
+ * @date   : 29-09-2014
+ *
+ *---------------------------------------------------------------------*/
+
+struct sr_packet_queue* dequeue_packet()
+{
+    struct sr_packet_queue *cur = queue_head;
+    if(cur == NULL) return cur;
+    else 
+    {
+	queue_head = cur->next;
+	cur->next = NULL;
+	free(cur);
+	return queue_head;
+    }
+}
+
+/*--------------------------------------------------------------------- 
+ * Method: _dump_pending_packets
+ * Scope:  Local
+ *
+ * Flush pending packets to the network.
+ *
+ * @author : Aditya Kousik
+ * @date   : 29-09-2014
+ *
+ *---------------------------------------------------------------------*/
+
+void _dump_pending_packets(uint32_t ip)
+{
+    struct sr_packet_queue *cur = queue_head, *tmp;
+    struct sr_ethernet_hdr *ethernet_hdr = 0;
+    unsigned char buf[ETHER_ADDR_LEN];
+    int retval = 0, byteCount;
+
+    tmp = cur;
+    while(cur != NULL)
+    {
+	if(cur->dst_ip.s_addr == ip)
+	{
+	    retval = sr_lookup_arp_cache(buf, *(struct in_addr*)&ip);
+	    if(!retval)
+	    {
+		ethernet_hdr = (struct sr_ethernet_hdr*)cur->root;
+
+	    	byteCount = 0;
+	    	while(byteCount < ETHER_ADDR_LEN) 
+	    	{
+		    ethernet_hdr->ether_dhost[byteCount] = (uint8_t)(buf[byteCount]);
+		    byteCount++;
+	        }
+	    	printf("\nInside dump : ");
+	    	ethernet_hdr->ether_type = htons(ETHERTYPE_IP);
+	    	byteCount = 0;
+	    	while(byteCount < cur->len)
+   	    	{
+		    printf("%x ", *(cur->root + byteCount * sizeof(uint8_t)));
+		    byteCount++;
+	    	}
+	        sr_print_packet_contents(cur->sr, cur->root, cur->len, cur->interface);
+	        sr_forward_packet(cur->sr, ethernet_hdr, cur->root, 
+				  cur->len, cur->interface, ERR_RSP_IP_FWD); 
+		tmp = dequeue_packet();
+	    }
+	}
+
+	cur = tmp;
+    }
+}
+
+/*--------------------------------------------------------------------- 
+ * Method: print_packet_queue
+ * Scope:  Local
+ *
+ * Print the local packet queue
+ *
+ * @author : Aditya Kousik
+ * @date   : 29-09-2014
+ *
+ *---------------------------------------------------------------------*/
+void print_packet_queue()
+{
+    struct sr_packet_queue *cur = queue_head;
+    int byteCount = 0;
+    printf("\nDestination IP");
+    while(cur != NULL)
+    {
+	printf("IP: \n%s ", inet_ntoa(*(struct in_addr*)&cur->dst_ip.s_addr)); 
+	while(byteCount < cur->len)
+	{
+	    byteCount++;
+	    printf("\n%x ", *(cur->root + sizeof(uint8_t) * byteCount)); 
+	}
+	cur = cur->next;
+    }
+}
+
+
+/*--------------------------------------------------------------------- 
+ * Method: enqueue_packet
+ * Scope:  Local
+ *
+ * Enqueue pending packet, usually because the router is waiting for
+ * an ARP Reply from the destination.
+ * 
+ * @author : Aditya Kousik
+ * @date   : 29-09-2014
+ *
+ *---------------------------------------------------------------------*/
+
+void enqueue_packet(struct sr_instance* sr, uint8_t *tmp, unsigned int len,
+		    char *interface, struct in_addr ip)
+{
+    struct sr_packet_queue *cur, *new;
+    uint8_t *buf = 0;
+    int byteCount;
+
+    new = (struct sr_packet_queue*)malloc(sizeof(struct sr_packet_queue));
+    new->sr = sr; new->len = len;
+    new->interface = interface; new->dst_ip = ip;
+    new->next = NULL; 
+    new->root = (uint8_t*)malloc(sizeof(uint8_t) * len);
+    buf = new->root;
+    printf("\nNew memory location allocated for root : %x", new->root);
+    printf("\nContents: ");
+    memcpy(new->root, tmp, sizeof(uint8_t) * len);
+
+    while(byteCount < len)
+    {
+	//*(new->root + byteCount * sizeof(uint8_t)) = *tmp + byteCount * sizeof(uint8_t); 
+	printf("%x ", *(buf + byteCount * sizeof(uint8_t)));
+	byteCount++;
+    }
+    if(queue_head == NULL)
+    { 
+	queue_head = new;
+    }
+	else
+	{
+	    cur = queue_head;	    
+	    while(cur->next != NULL) { cur = cur->next; } 
+	    cur->next = new;
+	}
+}
 
 /*--------------------------------------------------------------------- 
  * Method: count_umask_bits
@@ -582,7 +756,7 @@ uint8_t* sr_construct_new_packet(unsigned char mac_vrhost[ETHER_ADDR_LEN],
     ethernet_hdr = (struct sr_ethernet_hdr*) buf;
     switch(err_rsp_no)
     {
-	case ERR_RSP_ARP_REQ:
+	case ERR_RSP_ARP_REQ_GWAY: case ERR_RSP_ARP_REQ_SNET:
 		 	      arp_hdr = (struct sr_arphdr*) (buf + sizeof(struct sr_ethernet_hdr));
 			      arp_hdr->ar_hrd = htons(ARPHDR_ETHER);
 			      arp_hdr->ar_pro = htons(ETHERTYPE_IP);
@@ -642,7 +816,7 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 	ip_hdr = (struct ip*) (packet + sizeof(struct sr_ethernet_hdr));
    
         /* Routing is done here. At the network level */
-    	rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst);
+    	rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst); 
     
     	/* Set the new interface. This holds for ICMP too */
     	interface = &(rt_entry->interface);
@@ -656,14 +830,22 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 
     switch(err_rsp_no)
     {
-	case ERR_RSP_ARP_REQ: 
+	case ERR_RSP_ARP_REQ_SNET: 
+			      enqueue_packet(sr, newPacket, len, interface, ip_hdr->ip_dst); 
 			      newPacket = sr_construct_new_packet(mac_vrhost, ip_vrhost, 
-								  ip_hdr->ip_dst.s_addr, ERR_RSP_ARP_REQ); 
+								  ip_hdr->ip_dst.s_addr, ERR_RSP_ARP_REQ_SNET); 
 			      /* ARP packet. There's only gonna be eth_hdr and arp_hdr  */
 			      len = sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
 			      result = 0;
 			      break;
-
+	case ERR_RSP_ARP_REQ_GWAY: 
+			      enqueue_packet(sr, newPacket, len, interface, rt_entry->gw); 
+			      newPacket = sr_construct_new_packet(mac_vrhost, ip_vrhost, 
+								  rt_entry->gw.s_addr, ERR_RSP_ARP_REQ_GWAY); 
+			      /* ARP packet. There's only gonna be eth_hdr and arp_hdr  */
+			      len = sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
+			      result = 0;
+			      break;
 	case ERR_RSP_ARP_REP: 
 			      /* The payload already has the ARP reply in it. 
 			       * Swap the Source and Destination MAC address in the Ethernet header 
@@ -762,6 +944,7 @@ void sr_print_packet_contents(struct sr_instance* sr,
     /*  Begin traversing the packet list */
     ethernet_hdr = (struct sr_ethernet_hdr *)packet;
 
+    printf("\nInterface name : %s" ,iface); 
     printf("\n\n------Ethernet frame begins--------");
     
     printf("\nDestination MAC address : \t");
