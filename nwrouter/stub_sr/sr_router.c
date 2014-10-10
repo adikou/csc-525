@@ -27,6 +27,7 @@
 #include "sr_err_rsp.h"
 #include "sr_fwd_ref.h"
 #include "sr_packet_queue.h"
+#include "sr_icmp.h"
 
 /* Number of packets_queued */
 int PACKETS_QUEUED = 0;
@@ -72,7 +73,7 @@ void print_arp_cache()
     {
 	ip.s_addr = ntohl(cur->arp_sip);
 	printf("\n%x\t\t", ntohs(cur->arp_type));
-	printf("%s\t\t", inet_ntoa(ip));
+	printf("%s\t    ", inet_ntoa(ip));
 	print_ethernet_address(cur->arp_sha);
 	cur = cur->next;
    }
@@ -191,7 +192,7 @@ int sr_lookup_arp_cache(unsigned char *buf, struct in_addr ip)
  *
  *---------------------------------------------------------------------*/
 
-int compute_checksum (uint16_t *twoByte, int size)
+int compute_checksum (uint16_t *twoByte, int size, int fieldNum)
 {
     int twoByteCount = 1;
     unsigned long sum = 0;
@@ -200,7 +201,7 @@ int compute_checksum (uint16_t *twoByte, int size)
     while(twoByteCount <= size/2)
     {
 
-	if(twoByteCount != 6 )
+	if(twoByteCount != fieldNum )
 	{
 	    tmp = *twoByte++;
 	    sum += ntohs(tmp);
@@ -253,6 +254,78 @@ int verify_checksum (uint16_t *twoByte, int size)
 }
 
 /*--------------------------------------------------------------------- 
+ * Method: is_addressed_to_eth
+ * Scope:  Local
+ *
+ * Check if the IP packet is destined for the router's interfaces
+ *
+ * @author : Aditya Kousik
+ * @date   : 09-10-2014
+ *
+ *---------------------------------------------------------------------*/
+int is_addressed_to_eth(uint32_t ip, struct sr_instance *sr)
+{
+    int retval = 1;
+    struct sr_if *if_walker = sr->if_list;
+    while(if_walker)
+    {
+	if(if_walker->ip == ip) retval = 0;
+	if_walker = if_walker->next;
+    }
+    return retval;
+}
+
+/*--------------------------------------------------------------------- 
+ * Method: arp_miss_resolv
+ * Scope:  Local
+ *
+ * resolve ARP miss or default gateway hit.
+ *
+ * @author : Aditya Kousik
+ * @date   : 09-10-2014
+ *
+ *---------------------------------------------------------------------*/
+int arp_miss_resolv(struct sr_instance *sr, struct in_addr ip_dst,
+		uint8_t dhost[ETHER_ADDR_LEN])
+{
+
+    int byteCount, retval;
+    struct sr_rt *routing_entry;
+    routing_entry = sr_rtable_prefix_lookup(sr, ip_dst);
+    uint8_t buf[ETHER_ADDR_LEN];
+
+    /* ZERO! Default gateway. We know where it is.
+     * Just foward it. Do this by performing an ARP table lookup
+     * on the gw field of RTable entry. That will definitely 
+     * generate a hit (NOTE: We are not going to delete the
+     * default gw MAC address). Otherwise, the target IP is somewhere
+     * in our subnets. THEN issue an ARP REQ */
+    if(routing_entry->dest.s_addr == 0)
+    {
+    	printf("\nDefault Gateway hit!");
+	retval = sr_lookup_arp_cache(buf, routing_entry->gw);
+	/* We've assumed that the gateway MAC address is always in
+	 * the ARP cache, which is wrong. Check if ARP cache is a hit
+	 * and only then set it as ERR_RSP_IP_FWD */ 
+	if(!retval)
+	{
+	    byteCount = 0;
+	    while(byteCount < ETHER_ADDR_LEN) 
+	    {
+		dhost[byteCount] = (uint8_t)(buf[byteCount]);
+		byteCount++;
+	    } 
+	    return ERR_RSP_IP_FWD;
+	}
+	else return ERR_RSP_ARP_REQ_GWAY;
+    }
+    else
+    {
+	return ERR_RSP_ARP_REQ_SNET;
+    }
+}
+
+/*--------------------------------------------------------------------- 
  * Method: sr_handle_ether_frame
  * Scope:  Global
  *
@@ -288,7 +361,8 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
     uint8_t	  *byte;
     uint16_t      *twoByte;
     int       	  byteCount, size, retval;
-    
+    struct icmp   *icmp_hdr;    
+
     /* Interface resolutions */
     struct sr_if *if_packet = 0;
     
@@ -375,19 +449,9 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 			    if(err_rsp_no) 
 			    { err_rsp_no = ERR_RSP_IP_CHKSUM;  break; }
 
-			    /* Verify TTL validity and decrement only if packet is
-			     * not addressed to this machine's IP */
-			    if(ip_hdr->ip_dst.s_addr != ip_vrhost.s_addr)
-			    {
-			        if(ip_hdr->ip_ttl <= 0)
-			        { err_rsp_no = ERR_RSP_IP_TTL; break; }
-				    else ip_hdr->ip_ttl--;
-			    }
-
 			    /* Check the ARP cache for MAC address */
 			    print_arp_cache();
 			    retval = sr_lookup_arp_cache(buf, ip_hdr->ip_dst);
-			    printf("\n");print_ethernet_address((uint8_t*)buf);
 			    /* Found the MAC address. Set it to the ethernet 
 			     * header dhost */
 			    if(!retval)
@@ -400,48 +464,42 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 				    dhost[byteCount] = (uint8_t)(buf[byteCount]);
 				    byteCount++;
 			        }
-				//print_ethernet_address(dhost);
 			    }
 			    // ARP cache miss.
 			    else 
 		            {
-				 routing_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst);
-
-				 /* ZERO! Default gateway. We know where it is.
-				  * Just foward it. Do this by performing an ARP table lookup
-				  * on the gw field of RTable entry. That will definitely 
-				  * generate a hit (NOTE: We are not going to delete the
-				  * default gw MAC address). Otherwise, the target IP is somewhere
-				  * in our subnets. THEN issue an ARP REQ */
-				 if(routing_entry->dest.s_addr == 0)
-				 {
-				     printf("\nDefault Gateway hit!");
-				     retval = sr_lookup_arp_cache(buf, routing_entry->gw);
-				     /* We've assumed that the gateway MAC address is always in
-				      * the ARP cache, which is wrong. Check if ARP cache is a hit
-				      * and only then set it as ERR_RSP_IP_FWD */ 
-				     if(!retval)
-				     {
-				     	byteCount = 0;
-			             	while(byteCount < ETHER_ADDR_LEN) 
-			             	{
-				            dhost[byteCount] = (uint8_t)(buf[byteCount]);
-				            byteCount++;
-			             	} 
-				     	err_rsp_no = ERR_RSP_IP_FWD;
-				     }
-				     else err_rsp_no = ERR_RSP_ARP_REQ_GWAY;
-				 }
-				 else
-				 {
-					 err_rsp_no = ERR_RSP_ARP_REQ_SNET; printf("\nARPmiss"); 
-				 }
+				 err_rsp_no = arp_miss_resolv(sr, ip_hdr->ip_dst, dhost);
 			    }
 
+			    /* Verify TTL validity and decrement only if packet is
+			     * not addressed to this machine's IP */
+			    retval = is_addressed_to_eth(ip_hdr->ip_dst.s_addr, sr);
+			    printf("\nIs addressed to eth: %d", retval);
+			    if(retval)
+			    {
+			        if(ip_hdr->ip_ttl <= 0)
+			        { err_rsp_no = ERR_RSP_ICMP_TOUT; break; }
+				    else ip_hdr->ip_ttl--;
+			    }
+			    /* The IP packet is addressed to this router's 
+			     * interface. Read what type of IP message it is */
+			    else
+			    {
+				if(ntohs(ip_hdr->ip_p) == IPPROTO_TCP || 
+				   ntohs(ip_hdr->ip_p) == IPPROTO_UDP)
+				{ err_rsp_no = ERR_RSP_ICMP_PU; }
+
+				else if(ip_hdr->ip_p == IPPROTO_ICMP)
+				{
+				    icmp_hdr = (struct icmp*)(payload + sizeof(struct ip));
+				    if(icmp_hdr->type == ICMP_TYPE_ECHO_REQ)
+				    	err_rsp_no = ERR_RSP_ICMP_ECHO_REP;       	
+				}
+			    }
 			    /* The code would have broken if it hasn't reached this
 			     * point. So let's compute the checksum and store it 
 			     * at offset of 10 bytes */
-			    retval = compute_checksum(twoByte, size);
+			    retval = compute_checksum(twoByte, size, 6);
 			    ip_hdr->ip_sum = htons(retval);
 			    break;
 	default : err_rsp_no = -1; break;
@@ -513,13 +571,13 @@ void sr_handlepacket(struct sr_instance* sr,
 }/* end sr_ForwardPacket */
 
 /*--------------------------------------------------------------------- 
- * Method: _dump_pending_packets
+ * Method: dequeue_packet
  * Scope:  Local
  *
- * Flush pending packets to the network.
+ * Remove packet from linked list.
  *
  * @author : Aditya Kousik
- * @date   : 29-09-2014
+ * @date   : 08-10-2014
  *
  *---------------------------------------------------------------------*/
 
@@ -750,6 +808,7 @@ uint8_t* sr_construct_new_packet(unsigned char mac_vrhost[ETHER_ADDR_LEN],
     uint8_t *buf = 0, bufMAC[ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     struct sr_ethernet_hdr *ethernet_hdr = 0;
     struct sr_arphdr *arp_hdr = 0;
+    struct icmp *icmp_hdr = 0;
     unsigned char tmp[ETHER_ADDR_LEN] = {0};
 
     buf = (uint8_t*)malloc(sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr));
@@ -799,13 +858,16 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 		   char* interface, int err_rsp_no)
 {
 
-    uint8_t 	  buf[ETHER_ADDR_LEN], *newPacket = 0;
+    uint8_t 	  buf[ETHER_ADDR_LEN], *newPacket = 0, *byte;
     struct 	  sr_if *if_packet;
-    int 	  byteCount = 0, result = -1;
+    int 	  byteCount = 0, result = -1, size;
     unsigned char mac_vrhost[ETHER_ADDR_LEN];
     struct sr_rt* rt_entry;    
     uint32_t	  ip_vrhost;
+    uint16_t	  *twoByte;
     struct ip*    ip_hdr;
+    struct icmp*  icmp_hdr;
+    struct in_addr tmp;
 
     /* Could still be the old packet */
     newPacket = packet; 
@@ -865,6 +927,36 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 			      result = 0;
 			      break;
 
+	case ERR_RSP_ICMP_ECHO_REP:
+			      ip_hdr->ip_ttl = 64; tmp = ip_hdr->ip_src; 
+			      ip_hdr->ip_src = ip_hdr->ip_dst; ip_hdr->ip_dst = tmp; 
+			      /* Recompute Checksum */
+			      byte = (uint8_t*)ip_hdr;
+ 			      size = (*(byte) & 0x0f) << 2; twoByte = (uint16_t*)ip_hdr;
+			      result = compute_checksum(twoByte, size, 6);
+			      printf("Size %d, Checkum %x", size, result);
+			      ip_hdr->ip_sum = htons(result);
+
+
+			      icmp_hdr = (struct icmp*) (packet + sizeof(struct sr_ethernet_hdr) + sizeof(struct ip));
+			      twoByte = (uint16_t*)icmp_hdr;
+			      icmp_hdr->type = ICMP_TYPE_ECHO_REPLY;
+			      icmp_hdr->code = ICMP_TYPE_ECHO_REPLY;
+			      icmp_hdr->checksum = 0;
+			      result = compute_checksum(twoByte, 
+					 		len - sizeof(struct sr_ethernet_hdr) - sizeof(struct ip), 2);
+			      printf("Size %d, Checkum %x", len - sizeof(struct sr_ethernet_hdr) - sizeof(struct ip), result);
+			      icmp_hdr->checksum = htons(result);
+
+    			      rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst); 
+    			      interface = &(rt_entry->interface);
+    			      if_packet = sr_get_interface(sr, interface);
+	    		      memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
+
+			      result = arp_miss_resolv(sr, ip_hdr->ip_dst, ethernet_hdr->ether_dhost);
+			      if(result == ERR_RSP_ARP_REQ_GWAY) 
+				  sr_forward_packet(sr,ethernet_hdr,newPacket,len,interface,result);
+			      else result = 0;			
 
 	default		    : break;
     }

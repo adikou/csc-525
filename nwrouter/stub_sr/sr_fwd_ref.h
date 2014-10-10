@@ -8,7 +8,7 @@ int  walk_arp_cache(struct sr_arp_cache*);
 int  sr_lookup_arp_cache(unsigned char*, struct in_addr);
 
 /* IP-related methods */
-int compute_checksum(uint16_t*, int);
+int compute_checksum(uint16_t*, int, int);
 int verify_checksum(uint16_t*, int);
 int sr_handle_ethernet_frame(uint8_t*, uint8_t*, uint16_t,
 			     uint8_t*, struct sr_instance*);
