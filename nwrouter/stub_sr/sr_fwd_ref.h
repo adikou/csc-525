@@ -20,7 +20,7 @@ struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance*,
 int  sr_forward_packet(struct sr_instance*, struct sr_ethernet_hdr*,
 		    uint8_t*, unsigned int, char*, int);
 
-uint8_t* st_construct_new_packet(unsigned char*, uint32_t, uint32_t, int);
+uint8_t* st_construct_new_packet(unsigned char*, uint32_t, uint32_t, uint8_t*, int);
 
 
 /* Print methods for packet debugging  */

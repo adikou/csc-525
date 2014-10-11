@@ -16,6 +16,6 @@ struct icmp
     uint8_t code;
     uint16_t checksum;
     /* After this, it varies for every type of ICMP message */
-};
+} __attribute__ ((packed)) ;
 
 #endif /* SR_ICMP_H  */
