@@ -1,3 +1,4 @@
+
 /**********************************************************************
  * file:  sr_router.c 
  * date:  Mon Feb 18 12:50:42 PST 2002  
@@ -485,9 +486,9 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 			     * interface. Read what type of IP message it is */
 			    else
 			    {
-				if(ntohs(ip_hdr->ip_p) == IPPROTO_TCP || 
-				   ntohs(ip_hdr->ip_p) == IPPROTO_UDP)
-				{ err_rsp_no = ERR_RSP_ICMP_PU; }
+				if(ip_hdr->ip_p == IPPROTO_TCP || 
+				   ip_hdr->ip_p == IPPROTO_UDP)
+				{ err_rsp_no = ERR_RSP_ICMP_PU; break; }
 
 				else if(ip_hdr->ip_p == IPPROTO_ICMP)
 				{
@@ -839,10 +840,10 @@ uint8_t* sr_construct_new_packet(unsigned char mac_vrhost[ETHER_ADDR_LEN],
 			      }
 			      ethernet_hdr->ether_type = htons(ETHERTYPE_ARP);
 			      break;
-	case ERR_RSP_ICMP_TOUT: 
+	case ERR_RSP_ICMP_TOUT: case ERR_RSP_ICMP_HU: case ERR_RSP_ICMP_PU:
 				  bufSize =  sizeof(struct sr_ethernet_hdr) + sizeof(struct ip) +
 				  		  	 sizeof(struct icmp) + sizeof(uint32_t) +  sizeof(struct ip) + 
-				  		  	 8 * sizeof(uint8_t);
+				  		  	 8;
 				  buf = (char*)malloc(bufSize);
 				  ip_hdr = (struct ip*)(buf + sizeof(struct sr_ethernet_hdr));
 				  ip_hdr->ip_hl = sizeof(struct ip) / 4;
@@ -863,26 +864,81 @@ uint8_t* sr_construct_new_packet(unsigned char mac_vrhost[ETHER_ADDR_LEN],
 			      ip_hdr->ip_sum = htons(result);
 
 			      icmp_hdr = (struct icmp*) (buf + sizeof(struct sr_ethernet_hdr) + sizeof(struct ip));
-			      icmp_hdr->type = ICMP_TYPE_TOUT;
-			      icmp_hdr->code = ICMP_CODE_TTLXCD;
+			      switch(err_rsp_no)
+			      {
+				      case ERR_RSP_ICMP_TOUT: 
+				      						icmp_hdr->type = ICMP_TYPE_TOUT;
+				      						icmp_hdr->code = ICMP_CODE_TTLXCD;
+				      						break;
+				      case ERR_RSP_ICMP_PU:
+				      						icmp_hdr->type = ICMP_TYPE_DU;
+				      						icmp_hdr->code = ICMP_CODE_DU_PU;
+				      						break;
+				      case ERR_RSP_ICMP_HU:
+				      						icmp_hdr->type = ICMP_TYPE_DU;
+				      						icmp_hdr->code = ICMP_CODE_DU_HU;
+				      						break;
+			  	  }
 			      icmp_hdr->checksum = 0;
 			      data = (char*)(buf + sizeof(struct sr_ethernet_hdr) + 
 			      				 sizeof(struct ip) + sizeof(struct icmp));
 			      for(byteCount = 0; byteCount < IP_ADDR_LEN; byteCount++)
 			      	data[byteCount] = NULL;
-			      for(byteCount = 0; byteCount < sizeof(struct ip) + 8 * sizeof(uint8_t); byteCount++)
+			      for(byteCount = 0; byteCount < sizeof(struct ip) + 8; byteCount++)
 			      	data[byteCount + IP_ADDR_LEN] = ip_hdr_dgram[byteCount];
 			      twoByte = (uint16_t*)icmp_hdr;
 			      result = compute_checksum(twoByte, bufSize - 
 			      							sizeof(struct sr_ethernet_hdr) - sizeof(struct ip), 2);
-			      printf("\nSize %d, Checkum %x", bufSize - sizeof(struct sr_ethernet_hdr) - sizeof(struct ip), result);
+			      printf("\nSize %d, Checkum %x", bufSize - sizeof(struct sr_ethernet_hdr) - 
+			      		  sizeof(struct ip), result);
 			      icmp_hdr->checksum = htons(result);			    
-			      printf("Wait. Works till here\n");
 			      break;
     }
 
     return buf;
 }
+/*--------------------------------------------------------------------- 
+ * Method: increment_wait_counter
+ * Scope:  Global
+ *
+ * Increment wait count on an IP address. Return updated count.
+ * 
+ * @author : Aditya Kousik
+ * @date   : 10-10-2014
+ *
+ *---------------------------------------------------------------------*/
+int increment_wait_counter(struct in_addr ip, uint8_t resetVal)
+{
+	struct pending_packet_count *new = 0, *cur;
+	int flag, retval;
+	new = (struct pending_packet_count*)malloc(sizeof(struct pending_packet_count));
+	new->ip = ip.s_addr;
+	new->count = 0;
+	new->next = NULL;
+	if(PACKETS_QUEUED == NULL)
+    { 
+		PACKETS_QUEUED = new;
+    }
+	else
+	{
+	    cur = PACKETS_QUEUED;	    
+	    while(cur->next != NULL) 
+	    {   
+	    	if(cur->ip == ip.s_addr)
+	    	{
+	    	    retval = ++cur->count; 
+	    	    if(!resetVal) retval = cur->count = 0;
+	    	    flag++; break;
+	    	}
+	    	cur = cur->next; 
+	    } 
+	    if(!flag)
+	    	cur->next = new;
+	}
+
+	return retval;
+}
+
 
 /*--------------------------------------------------------------------- 
  * Method: sr_forward_packet
@@ -934,21 +990,20 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 
     switch(err_rsp_no)
     {
-	case ERR_RSP_ARP_REQ_SNET: 
+	case ERR_RSP_ARP_REQ_SNET: case ERR_RSP_ARP_REQ_GWAY: 
 			      enqueue_packet(sr, newPacket, len, interface, ip_hdr->ip_dst); 
-			      newPacket = sr_construct_new_packet(mac_vrhost, ip_vrhost, 
-								  ip_hdr->ip_dst.s_addr, NULL, ERR_RSP_ARP_REQ_SNET); 
-			      /* ARP packet. There's only gonna be eth_hdr and arp_hdr  */
-			      len = sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
-			      result = 0;
-			      break;
-	case ERR_RSP_ARP_REQ_GWAY: 
-			      enqueue_packet(sr, newPacket, len, interface, rt_entry->gw); 
-			      newPacket = sr_construct_new_packet(mac_vrhost, ip_vrhost, 
-								  rt_entry->gw.s_addr, NULL, ERR_RSP_ARP_REQ_GWAY); 
-			      /* ARP packet. There's only gonna be eth_hdr and arp_hdr  */
-			      len = sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
-			      result = 0;
+			      switch(err_rsp_no)
+			      {
+				      case ERR_RSP_ARP_REQ_SNET: 
+				      				  newPacket = sr_construct_new_packet(mac_vrhost, ip_vrhost, 
+									  ip_hdr->ip_dst.s_addr, NULL, err_rsp_no); break;
+					  case ERR_RSP_ARP_REQ_GWAY:
+					  				  newPacket = sr_construct_new_packet(mac_vrhost, ip_vrhost, 
+									  rt_entry->gw.s_addr, NULL, err_rsp_no); break;
+				  }					  				  
+				  /* ARP packet. There's only gonna be eth_hdr and arp_hdr  */
+				  len = sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
+				  result = 0;
 			      break;
 	case ERR_RSP_ARP_REP: 
 			      /* The payload already has the ARP reply in it. 
@@ -1000,7 +1055,7 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 				  sr_forward_packet(sr,ethernet_hdr,newPacket,len,interface,result);
 			      else result = 0;			
 			      break;
-	case ERR_RSP_ICMP_TOUT:
+	case ERR_RSP_ICMP_TOUT: case ERR_RSP_ICMP_PU: case ERR_RSP_ICMP_HU:
 				  ip_hdr = (struct ip*) (newPacket + sizeof(struct sr_ethernet_hdr));
 				  newPacket = sr_construct_new_packet(mac_vrhost, ip_hdr->ip_dst.s_addr,
 				  									  ip_hdr->ip_src.s_addr, (uint8_t*)ip_hdr, err_rsp_no);
@@ -1019,6 +1074,7 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
 			      if(result == ERR_RSP_ARP_REQ_GWAY) 
 				  	sr_forward_packet(sr,ethernet_hdr, newPacket, len, interface, result);
 			      else result = 0;			
+			      break;
 
 	default		    : break;
     }
