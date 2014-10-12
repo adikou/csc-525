@@ -30,14 +30,15 @@
 #include "sr_packet_queue.h"
 #include "sr_icmp.h"
 
-/* Number of packets_queued */
-int PACKETS_QUEUED = 0;
+/* Number of QUEUE_COUNT */
+struct pending_packet_count *QUEUE_COUNT = NULL;
 
 /*Initialise an empty ARP cache */
-struct sr_arp_cache *arp_cache_root = NULL; 
+struct sr_arp_cache *arp_cache_head = NULL; 
 
 /* Initialise empty packet queue  */
 struct sr_packet_queue *queue_head = NULL;
+struct sr_packet_queue *queue_tail = NULL;
 
 /*--------------------------------------------------------------------- 
  * Method: sr_init(void)
@@ -67,7 +68,7 @@ void sr_init(struct sr_instance* sr)
  *---------------------------------------------------------------------*/
 void print_arp_cache()
 {
-    struct sr_arp_cache *cur = arp_cache_root;
+    struct sr_arp_cache *cur = arp_cache_head;
     struct in_addr ip;
     printf("\nProtocol Type\tIP address \tMAC address");
     while(cur != NULL)
@@ -99,19 +100,12 @@ void add_arp_cache_tuple(struct sr_arp_cache *tuple)
     new = (struct sr_arp_cache*)malloc(sizeof(struct sr_arp_cache));
     new->arp_type = tuple->arp_type; new->arp_sip = tuple->arp_sip;
     memcpy(new->arp_sha, tuple->arp_sha, ETHER_ADDR_LEN);
-    new->next = NULL;
+    new->next = arp_cache_head;
     
-    if(arp_cache_root == NULL)
-    { 
-	arp_cache_root = new;
-    }
-    else
-    {		    
-    	    cur = arp_cache_root; 
-	    while(cur->next != NULL) { cur = cur->next; } 
-	    cur->next = new;
-    }
-        
+    if(arp_cache_head != NULL)
+    	arp_cache_head->prev = new;
+    arp_cache_head = new;
+    new->prev = NULL;
 }
 
 /*--------------------------------------------------------------------- 
@@ -130,19 +124,19 @@ int walk_arp_cache(struct sr_arp_cache *tuple)
     int retval = 0;
     struct sr_arp_cache *cur;
 
-    if(arp_cache_root == NULL) return retval;
-    cur = arp_cache_root;
+    if(arp_cache_head == NULL) return retval;
+    cur = arp_cache_head;
 
     while(cur != NULL)
     {
-	if(cur->arp_type == tuple->arp_type && cur->arp_sip == tuple->arp_sip)
-	{
-	    /*There is a <proto_type,sender_address> present. 
-	     *Let's update its hw_addr */
-	    memcpy(cur->arp_sha, tuple->arp_sha,ETHER_ADDR_LEN);
-	    return ++retval;
-	}
-	cur = cur->next;
+		if(cur->arp_type == tuple->arp_type && cur->arp_sip == tuple->arp_sip)
+		{
+		    /*There is a <proto_type,sender_address> present. 
+		     *Let's update its hw_addr */
+		    memcpy(cur->arp_sha, tuple->arp_sha,ETHER_ADDR_LEN);
+		    return ++retval;
+		}
+		cur = cur->next;
     }
     return retval;
 }
@@ -164,8 +158,8 @@ int sr_lookup_arp_cache(unsigned char *buf, struct in_addr ip)
     int retval = -1;
     struct sr_arp_cache *cur;
 
-    if(arp_cache_root == NULL) retval = -1;
-    cur = arp_cache_root;
+    if(arp_cache_head == NULL) retval = -1;
+    cur = arp_cache_head;
 
     while(cur != NULL)
     {
@@ -427,9 +421,7 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 				/* Do nothing with the REPLY packet. Drop it  */
 				else
 				{
-				    printf("\nARP REPLY: PRINT ARP CACHE NOW");
-				    print_arp_cache();
-				    _dump_pending_packets(arp_hdr->ar_sip);
+				    _dump_pending_packets(arp_hdr->ar_sip, 1);
 				    err_rsp_no = ERR_RSP_ARP_NIL;
 				}
 					
@@ -457,19 +449,19 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 			     * header dhost */
 			    if(!retval)
 			    {
-				printf("\nARPhit");
-				err_rsp_no = ERR_RSP_IP_FWD;
+					printf("\nARPhit");
+					err_rsp_no = ERR_RSP_IP_FWD;
 			        byteCount = 0;
 			        while(byteCount < ETHER_ADDR_LEN) 
 			        {
-				    dhost[byteCount] = (uint8_t)(buf[byteCount]);
-				    byteCount++;
+					    dhost[byteCount] = (uint8_t)(buf[byteCount]);
+					    byteCount++;
 			        }
 			    }
 			    // ARP cache miss.
 			    else 
-		            {
-				 err_rsp_no = arp_miss_resolv(sr, ip_hdr->ip_dst, dhost);
+		        {
+				 	err_rsp_no = arp_miss_resolv(sr, ip_hdr->ip_dst, dhost);
 			    }
 
 			    /* Verify TTL validity and decrement only if packet is
@@ -582,17 +574,14 @@ void sr_handlepacket(struct sr_instance* sr,
  *
  *---------------------------------------------------------------------*/
 
-struct sr_packet_queue* dequeue_packet()
+void dequeue_packet(struct sr_packet_queue *node)
 {
-    struct sr_packet_queue *cur = queue_head;
-    if(cur == NULL) return cur;
-    else 
-    {
-	queue_head = cur->next;
-	cur->next = NULL;
-	free(cur);
-	return queue_head;
-    }
+    if(node->prev != NULL)
+    	node->prev->next = node->next;
+    else queue_head = node->next;
+    if(node->next != NULL)
+    	node->next->prev = node->prev;
+    free(node);
 }
 
 /*--------------------------------------------------------------------- 
@@ -606,45 +595,49 @@ struct sr_packet_queue* dequeue_packet()
  *
  *---------------------------------------------------------------------*/
 
-void _dump_pending_packets(uint32_t ip)
+void _dump_pending_packets(uint32_t ip, int sendFlag)
 {
     struct sr_packet_queue *cur = queue_head, *tmp;
     struct sr_ethernet_hdr *ethernet_hdr = 0;
     unsigned char buf[ETHER_ADDR_LEN];
     int retval = 0, byteCount;
 
-    tmp = cur;
     while(cur != NULL)
     {
-	if(cur->dst_ip.s_addr == ip)
-	{
-	    retval = sr_lookup_arp_cache(buf, *(struct in_addr*)&ip);
-	    if(!retval)
-	    {
-		ethernet_hdr = (struct sr_ethernet_hdr*)cur->root;
-
-	    	byteCount = 0;
-	    	while(byteCount < ETHER_ADDR_LEN) 
-	    	{
-		    ethernet_hdr->ether_dhost[byteCount] = (uint8_t)(buf[byteCount]);
-		    byteCount++;
-	        }
-	    	printf("\nInside dump : ");
-	    	ethernet_hdr->ether_type = htons(ETHERTYPE_IP);
-	    	byteCount = 0;
-	    	while(byteCount < cur->len)
-   	    	{
-		    printf("%x ", *(cur->root + byteCount * sizeof(uint8_t)));
-		    byteCount++;
-	    	}
-	        sr_print_packet_contents(cur->sr, cur->root, cur->len, cur->interface);
-	        sr_forward_packet(cur->sr, ethernet_hdr, cur->root, 
-				  cur->len, cur->interface, ERR_RSP_IP_FWD); 
-		tmp = dequeue_packet();
-	    }
-	}
-
-	cur = tmp;
+		if(cur->dst_ip.s_addr == ip)
+		{
+			retval = sr_lookup_arp_cache(buf, *(struct in_addr*)&ip);
+			printf("\nRetval is %d", retval);
+			if(!retval)
+			{
+				ethernet_hdr = (struct sr_ethernet_hdr*)cur->root;
+			  	byteCount = 0;
+			  	while(byteCount < ETHER_ADDR_LEN) 
+			   	{
+				    ethernet_hdr->ether_dhost[byteCount] = (uint8_t)(buf[byteCount]);
+				    byteCount++;
+			    }
+			   	printf("\nInside dump : ");
+			   	ethernet_hdr->ether_type = htons(ETHERTYPE_IP);
+			   	byteCount = 0;
+			   	while(byteCount < cur->len)
+		   	   	{
+				    printf("%x ", *(cur->root + byteCount * sizeof(uint8_t)));
+				    byteCount++;
+			   	}
+	        	sr_forward_packet(cur->sr, ethernet_hdr, cur->root, 
+					  	cur->len, cur->interface, ERR_RSP_IP_FWD); 
+			    
+			}
+			if(!sendFlag)
+			{
+				ethernet_hdr = (struct sr_ethernet_hdr*)cur->root;
+				sr_forward_packet(cur->sr, ethernet_hdr, cur->root, 
+					  			  cur->len, cur->interface, ERR_RSP_ICMP_HU);
+			} 
+    		dequeue_packet(cur);    
+		}
+		cur = cur->next;
     }
 }
 
@@ -665,14 +658,48 @@ void print_packet_queue()
     printf("\nDestination IP");
     while(cur != NULL)
     {
-	printf("IP: \n%s ", inet_ntoa(*(struct in_addr*)&cur->dst_ip.s_addr)); 
-	while(byteCount < cur->len)
-	{
-	    byteCount++;
-	    printf("\n%x ", *(cur->root + sizeof(uint8_t) * byteCount)); 
-	}
-	cur = cur->next;
+		printf("\nIP: %s ", inet_ntoa(cur->dst_ip)); 
+		cur = cur->next;
     }
+}
+/*--------------------------------------------------------------------- 
+ * Method: increment_wait_counter
+ * Scope:  Global
+ *
+ * Increment wait count on an IP address. Return updated count.
+ * 
+ * @author : Aditya Kousik
+ * @date   : 10-10-2014
+ *
+ *---------------------------------------------------------------------*/
+int increment_wait_counter(struct in_addr ip, int resetVal)
+{
+	struct pending_packet_count *new, *cur;
+	int flag, retval;
+	
+	cur = QUEUE_COUNT;
+
+	while(cur != NULL && cur->ip != ip.s_addr)
+		cur = cur->next;
+	if(cur == NULL)
+	{
+		new = (struct pending_packet_count*)malloc(sizeof(struct pending_packet_count));
+		new->ip = ip.s_addr;
+		new->count = 1;
+		new->next = QUEUE_COUNT;
+		if(QUEUE_COUNT != NULL)
+			QUEUE_COUNT->prev = new;
+		QUEUE_COUNT = new;
+		new->prev = NULL;
+	}
+	else
+	{
+		retval = ++(cur->count);
+		if(resetVal)
+			cur->count = retval = 0;
+	}
+	
+	return retval;
 }
 
 
@@ -691,35 +718,33 @@ void print_packet_queue()
 void enqueue_packet(struct sr_instance* sr, uint8_t *tmp, unsigned int len,
 		    char *interface, struct in_addr ip)
 {
-    struct sr_packet_queue *cur, *new;
-    uint8_t *buf = 0;
-    int byteCount;
-
-    new = (struct sr_packet_queue*)malloc(sizeof(struct sr_packet_queue));
-    new->sr = sr; new->len = len;
-    new->interface = interface; new->dst_ip = ip;
-    new->next = NULL; 
-    new->root = (uint8_t*)malloc(sizeof(uint8_t) * len);
-    buf = new->root;
-    printf("\nNew memory location allocated for root : %x", new->root);
-    printf("\nContents: ");
-    memcpy(new->root, tmp, sizeof(uint8_t) * len);
-
-    while(byteCount < len)
+    struct sr_packet_queue *new;
+    int byteCount, counter;
+    counter = increment_wait_counter(ip, 0);
+    if(counter != 6)
     {
-	//*(new->root + byteCount * sizeof(uint8_t)) = *tmp + byteCount * sizeof(uint8_t); 
-	printf("%x ", *(buf + byteCount * sizeof(uint8_t)));
-	byteCount++;
-    }
-    if(queue_head == NULL)
-    { 
-	queue_head = new;
-    }
+    	printf("\nCounter is %d", counter);
+	    new = (struct sr_packet_queue*)malloc(sizeof(struct sr_packet_queue));
+	    new->sr = sr; new->len = len;
+	    new->interface = interface; new->dst_ip = ip;
+	    new->root = (uint8_t*)malloc(sizeof(uint8_t) * len);
+	    memcpy(new->root, tmp, sizeof(uint8_t) * len);
+
+	    new->prev = queue_tail;
+	    if(queue_tail != NULL)
+	    	queue_tail->next = new;
+	    else
+	    	queue_head = new;
+	    queue_tail = new;
+	    new->next = NULL;
+	}
 	else
 	{
-	    cur = queue_head;	    
-	    while(cur->next != NULL) { cur = cur->next; } 
-	    cur->next = new;
+		printf("\nCounter is %d", counter);
+		print_packet_queue();
+		_dump_pending_packets(ip.s_addr, 0);
+		counter = increment_wait_counter(ip, 1);
+		printf("\nCounter is %d", counter);
 	}
 }
 
@@ -896,47 +921,6 @@ uint8_t* sr_construct_new_packet(unsigned char mac_vrhost[ETHER_ADDR_LEN],
     }
 
     return buf;
-}
-/*--------------------------------------------------------------------- 
- * Method: increment_wait_counter
- * Scope:  Global
- *
- * Increment wait count on an IP address. Return updated count.
- * 
- * @author : Aditya Kousik
- * @date   : 10-10-2014
- *
- *---------------------------------------------------------------------*/
-int increment_wait_counter(struct in_addr ip, uint8_t resetVal)
-{
-	struct pending_packet_count *new = 0, *cur;
-	int flag, retval;
-	new = (struct pending_packet_count*)malloc(sizeof(struct pending_packet_count));
-	new->ip = ip.s_addr;
-	new->count = 0;
-	new->next = NULL;
-	if(PACKETS_QUEUED == NULL)
-    { 
-		PACKETS_QUEUED = new;
-    }
-	else
-	{
-	    cur = PACKETS_QUEUED;	    
-	    while(cur->next != NULL) 
-	    {   
-	    	if(cur->ip == ip.s_addr)
-	    	{
-	    	    retval = ++cur->count; 
-	    	    if(!resetVal) retval = cur->count = 0;
-	    	    flag++; break;
-	    	}
-	    	cur = cur->next; 
-	    } 
-	    if(!flag)
-	    	cur->next = new;
-	}
-
-	return retval;
 }
 
 

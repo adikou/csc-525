@@ -3,7 +3,7 @@
  * date:  Mon Oct 07 04:02:12 PDT 2002  
  * Author:  casado@stanford.edu
  *
- * Description: Kamath is a dick.
+ * Description:
  *
  *---------------------------------------------------------------------------*/
 
