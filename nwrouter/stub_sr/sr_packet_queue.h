@@ -20,7 +20,7 @@ struct pending_packet_count
 	int		 count;
 	struct pending_packet_count *next;
 	struct pending_packet_count *prev;
-} __attribute__ ((packed));
+};
 
 
 void print_packet_queue();
@@ -28,6 +28,6 @@ void enqueue_packet(struct sr_instance*, uint8_t*,
 		    unsigned int, char*, struct in_addr);
 int increment_wait_counter(struct in_addr, int);
 void dequeue_packet(struct sr_packet_queue*);
-void _dump_pending_packets(uint32_t, int);
+int _dump_pending_packets(uint32_t, int);
 
 #endif /* SR_PACKET_QUEUE_H  */
