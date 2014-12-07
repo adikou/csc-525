@@ -40,6 +40,7 @@
 #include "sr_router.h"
 #include "sr_if.h"
 #include "sr_protocol.h"
+#include "sr_pwospf.h"
 
 #include "sha1.h"
 #include "vnscommand.h"
@@ -488,6 +489,7 @@ int sr_read_from_server_expect(struct sr_instance* sr /* borrowed */, int expect
                 return -1;
             }
             printf(" <-- Ready to process packets --> \n");
+            pwospf_init(sr);
             break;
 
             /* ---------------- VNS_RTABLE ---------------- */

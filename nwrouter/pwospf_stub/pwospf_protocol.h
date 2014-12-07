@@ -12,6 +12,7 @@
 #ifndef PWOSPF_PROTOCOL_H
 #define PWOSPF_PROTOCOL_H
 
+static const uint8_t IPPROTO_OSPF = 0x59;
 static const uint8_t OSPF_V2        = 2;
 
 static const uint32_t OSPF_AllSPFRouters = 0xe0000005; /*"224.0.0.5"*/

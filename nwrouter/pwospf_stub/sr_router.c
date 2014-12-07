@@ -23,6 +23,7 @@
 #include "sr_router.h"
 #include "sr_protocol.h"
 #include "sr_pwospf.h"
+#include "pwospf_protocol.h"
 
 /* Thread includes */
 #include <pthread.h>
@@ -57,7 +58,6 @@ pthread_t *thread, *watch_count;
 struct timeval tv;
 double startTime, endTime;
 
-
 pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;    
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t count_threshold_cv = PTHREAD_COND_INITIALIZER;
@@ -78,7 +78,7 @@ void sr_init(struct sr_instance* sr)
     assert(sr);
     /* Add initialization code here! */
 
-    pwospf_init(sr);
+    /*pwospf_init(sr);*/
 
 } /* -- sr_init -- */
 
@@ -473,7 +473,8 @@ void *thread_handler(void *arg)
         sr_send_packet(curPacket->sr, newPacket, len, curPacket->interface);
         cur->numPacketsSent++;
         for(i = 0; i < 1000000; ++i);
-        sleep(1);
+        if(cur->received == 0)
+            usleep(5000);
     }
     if(cur->numPacketsSent >= MAX_ARP_REQ) 
     {
@@ -652,21 +653,23 @@ int sr_ip_forwarding(struct sr_instance *sr,
     /* Routing is done here. At the network level */
     rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst); 
     
-    /* Set the new interface. This holds for ICMP too */
-    *interface = rt_entry->interface;
-    
+    if(rt_entry != NULL)
+    {
+        /* Set the new interface. This holds for ICMP too */
+        *interface = rt_entry->interface;
+        
 
-    if(rt_entry->gw.s_addr == 0)
-        memcpy(next_hop, &rt_entry->dest, sizeof(struct in_addr));
-            
-    else memcpy(next_hop, &rt_entry->gw, sizeof(struct in_addr));
+        if(rt_entry->gw.s_addr == 0)
+            memcpy(next_hop, &rt_entry->dest, sizeof(struct in_addr));
+                
+        else memcpy(next_hop, &rt_entry->gw, sizeof(struct in_addr));
 
 
-    /* Check the ARP cache for MAC address */
-    err_rsp_no = arp_addr_resolv(sr, dhost, *next_hop, buf);
+        /* Check the ARP cache for MAC address */
+        err_rsp_no = arp_addr_resolv(sr, dhost, *next_hop, buf);
 
-    
-    print_ethernet_address(dhost);
+    }
+    else return ERR_RSP_IP_DROP;
 
     /* Verify TTL validity and decrement only if packet is
      * not addressed to this machine's IP */
@@ -724,6 +727,7 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
 {
 
     int err_rsp_no;
+    struct ip *ip_hdr;
     err_rsp_no = -1;
     switch(type)
     {
@@ -731,7 +735,12 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
                     err_rsp_no = sr_arp_handle(sr, dhost, payload, *interface);
                     break;
         case ETHERTYPE_IP : 
-                    err_rsp_no = sr_ip_forwarding(sr, dhost, payload, interface, next_hop);
+                    ip_hdr = (struct ip*)payload;
+                    if(ip_hdr->ip_p != IPPROTO_OSPF)
+                        err_rsp_no = sr_ip_forwarding(sr, dhost, payload, interface, next_hop);
+
+                    /* Let pwospf handle this */
+                    else sr_handle_pwospf(sr, payload, *interface);
                     break;
         default : err_rsp_no = -1; break;
         }
@@ -786,7 +795,7 @@ void sr_handlepacket(struct sr_instance* sr,
     printf("\n*** -> Received packet of length %d \n",len);
  
     // For Debugging. Print contents of packet before processing.
-    sr_print_packet_contents(tmp, packet, len, interface);
+    //sr_print_packet_contents(tmp, packet, len, interface);
     
     /*  Begin traversing the packet list */
     ethernet_hdr = (struct sr_ethernet_hdr *) packet;
@@ -1067,7 +1076,7 @@ struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
     int numBits;
     
     rtable_entry = sr->routing_table;
-    if(rtable_entry == 0) return(0);
+    if(rtable_entry == NULL) return NULL;
 
     while(rtable_entry)
     {
@@ -1301,9 +1310,12 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
                   icmp_hdr->checksum = htons(result);
 
                       rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst); 
-                      fromInterface = rt_entry->interface;
-                      if_packet = sr_get_interface(sr, fromInterface);
-                      memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
+                      if(rt_entry != NULL)
+                      {
+                          fromInterface = rt_entry->interface;
+                          if_packet = sr_get_interface(sr, fromInterface);
+                            memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
+                      }
 
                   localRes = arp_addr_resolv(sr, ethernet_hdr->ether_dhost,
                                                ip_hdr->ip_dst, buf);
