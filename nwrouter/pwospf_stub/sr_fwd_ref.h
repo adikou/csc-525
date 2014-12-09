@@ -33,6 +33,6 @@ void print_ethernet_address(uint8_t *);
 
 /*PWOSPF methods*/
 long int getProperty(char*);
-void sr_handle_pwospf(struct sr_instance*, uint8_t*, char*);
+void sr_handle_pwospf(struct sr_instance*, uint8_t*, int, char*);
 
 #endif /* SR_FWD_REF_H  */

@@ -148,14 +148,14 @@ void printGraph(struct graph *subnetGraph)
     for(i = subnetGraph->vList; i; i = i->next)
     {
         struct adjList *cur = i->v.head;
-        printf("\nAdjacency list of vertex %d rid %s", i->v.id
+        printf("\nAdjacency list of vertex %d rid %s ", i->v.id
                     ,inet_ntoa(*(struct in_addr*)&i->v.rid)); 
         printf("snet %s type %d \nroot "
                     ,inet_ntoa(*(struct in_addr*)&i->v.subnet)
                     ,i->v.type);
         while (cur)
         {
-            printf("-> %d %d", cur->e.to, cur->e.weight); 
+            printf("-> %d", cur->e.to); 
             cur = cur->next;
         }
         printf("\n");
@@ -173,7 +173,7 @@ struct adjList* isEdgePresent(struct graph* subnetGraph, int v, int w)
         while(edge)
         {
             if(edge->e.from == v && edge->e.to == w)
-                return 1;
+                return edge;
             edge = edge->next;
         }
         cur = cur->next;
@@ -216,6 +216,7 @@ void addVertex(struct graph *subnetGraph, uint32_t rid, uint32_t subnet, int typ
     vl->v.id = vid++;
     vl->v.rid = rid;
     vl->v.subnet = subnet;
+    vl->v.latestSeqNum = 0;
     vl->v.type = type;
     vl->v.head = NULL;
     vl->next = subnetGraph->vList;
@@ -260,6 +261,24 @@ long int getProperty(char *propName)
     return -1;
 }
 
+uint32_t getNeighborRid(uint32_t subnet)
+{
+    int i = 0;
+    uint32_t tmp;
+    for(i = 0; i < numInterfaces; ++i)
+    {
+        tmp = neighbors[i].ip & neighbors[i].nmask;
+        if(tmp == subnet)
+        {
+            if(neighbors[i].isAlive == ALIVE)
+            {
+                return neighbors[i].rid;
+            }
+        }
+    }
+    return 0;
+}
+
 void initNeighbor(int idx)
 {
     char iface[10] = "eth", buf[2];
@@ -270,6 +289,7 @@ void initNeighbor(int idx)
     neighbors[idx].iface = (char*)malloc(strlen(iface) + 1);
     strcpy(neighbors[idx].iface, iface);
     neighbors[idx].isAlive = ALIVE;
+    neighbors[idx].nmask = 0;
     gettimeofday(&tv, NULL);
     curTime = tv.tv_sec;
     neighbors[idx].tstamp = curTime;
@@ -280,9 +300,11 @@ int getIndex(char *iface)
     return iface[3] - (int)'0';
 }
 
-int log_hello_pkt(struct sr_instance *sr, uint8_t* payload,
+int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
+                    int len,
                       char* interface)
 {
+    uint8_t *payload = (uint8_t*)(packet + sizeof(struct sr_ethernet_hdr));
     struct sr_if *walker;
     struct ip *ip_hdr = (struct ip*)payload;
     struct ospfv2_hdr *ospf_hdr = (struct ospfv2_hdr*)(payload 
@@ -301,8 +323,10 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* payload,
     {
         neighbors[idx].rid = ospf_hdr->rid;
         neighbors[idx].ip = ip_hdr->ip_src.s_addr;
+        neighbors[idx].nmask = hello_packet->nmask;
         gettimeofday(&tv, NULL);
         curTime = tv.tv_sec;
+        neighbors[idx].isAlive = ALIVE;
         neighbors[idx].tstamp = curTime;
     }
     else
@@ -316,19 +340,25 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* payload,
 
 }
 
-int log_lsu_pkt(struct sr_instance *sr, uint8_t* payload,
+int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
+                int len,
                       char* interface)
 {
-    int i;
+    int i, byteCount, result;
+    uint8_t *payload;
+    uint16_t *twoByte;
     long int numAdv;
     struct sr_if *walker;
-    struct ip *ip_hdr = (struct ip*)payload;
+    payload = (uint8_t*)(packet + sizeof(struct sr_ethernet_hdr));
     struct ospfv2_hdr *ospf_hdr = (struct ospfv2_hdr*)(payload 
                                   + sizeof(struct ip));
     struct ospfv2_lsu_hdr *lsu_hdr;
     struct ospfv2_lsu *lsa, *lsa_pkt;
-    struct vertexList *v, *w;
+    struct vertexList *v, *w, *tmp;
 
+    struct sr_ethernet_hdr *ethernet_hdr;
+    unsigned char mac_src[ETHER_ADDR_LEN];
+    
     lsu_hdr = (struct ospfv2_lsu_hdr*)(payload + sizeof(struct ip)
                                                + sizeof(struct ospfv2_hdr));
 
@@ -340,11 +370,25 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* payload,
     numAdv = ntohl(lsu_hdr->num_adv);
     memcpy(lsa, lsa_pkt, numAdv * sizeof(struct ospfv2_lsu));
 
-    printf("\n%p",ospf_hdr->rid);
-    printf("\n%p", getRouterByRid(subnetGraph, ospf_hdr->rid));
+    if(ospf_hdr->rid == rid)
+        return ERR_RSP_OSPF_LSU_DROP;
+    else
+    {
+        tmp = getRouterByRid(subnetGraph, ospf_hdr->rid);
+        if(tmp != NULL)
+        {
+            if(tmp->v.latestSeqNum >= ntohs(lsu_hdr->seq))
+                return ERR_RSP_OSPF_LSU_DROP;
+            else tmp->v.latestSeqNum = ntohs(lsu_hdr->seq);
+        }
+    }
 
-     if(getRouterByRid(subnetGraph, ospf_hdr->rid) == NULL)
-            addVertex(subnetGraph, ospf_hdr->rid, 0, VTYPE_ROUTER);
+    if(getRouterByRid(subnetGraph, ospf_hdr->rid) == NULL)
+    {
+        addVertex(subnetGraph, ospf_hdr->rid, 0, VTYPE_ROUTER);
+        tmp = getRouterByRid(subnetGraph, ospf_hdr->rid);
+        tmp->v.latestSeqNum = ntohs(lsu_hdr->seq);
+    }
     for(i = 0; i < numAdv; ++i)
     {
         if(getNodeBySubnet(subnetGraph, lsa[i].subnet, ospf_hdr->rid) == NULL)
@@ -355,16 +399,57 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* payload,
         
         if(!isEdgePresent(subnetGraph, v->v.id, w->v.id))
             addEdge(v, w, 1);        
+
+        if(lsa[i].rid != 0)
+        {
+            if(getRouterByRid(subnetGraph, lsa[i].rid) == NULL)
+                addVertex(subnetGraph, lsa[i].rid, 0, VTYPE_ROUTER);
+        }
+
+        v = getRouterByRid(subnetGraph, ospf_hdr->rid);
+        w = getRouterByRid(subnetGraph, lsa[i].rid);
+
+        if(v!= NULL && w!= NULL)   
+        {
+            if(!isEdgePresent(subnetGraph, v->v.id, w->v.id))
+                addEdge(v, w, 1);        
+            if(!isEdgePresent(subnetGraph, w->v.id, v->v.id))
+                addEdge(w, v, 1);        
+        }
+        lsu_hdr->ttl--;
+        walker = sr->if_list;
+        while(walker)
+        {
+            memcpy(mac_src, walker->addr, ETHER_ADDR_LEN);            
+            ethernet_hdr = (struct sr_ethernet_hdr*)packet;
+            byteCount = 0;
+            while(byteCount < ETHER_ADDR_LEN) 
+            {  
+                ethernet_hdr->ether_shost[byteCount] = *(uint8_t*)(&mac_src[byteCount]);
+                byteCount++;
+            }
+
+            twoByte = (uint16_t*)ospf_hdr;
+            result = compute_checksum(twoByte, ntohs(ospf_hdr->len), 7);
+            ospf_hdr->csum = htons(result);
+
+            if(strcmp(walker->name, interface) != 0)
+                sr_send_packet(sr, packet, len, walker->name);
+                    
+            walker = walker->next;
+        }
     }
 
     return 0;
 }
 
-void sr_handle_pwospf(struct sr_instance *sr, uint8_t* payload,
+void sr_handle_pwospf(struct sr_instance *sr, uint8_t* packet,
+                      int len,
                       char* interface)
 {
     int err_rsp_no;
-    
+    uint8_t* payload = (uint8_t*)(packet + sizeof(struct sr_ethernet_hdr));
+
     struct ospfv2_hdr *ospf_hdr = (struct ospfv2_hdr*)(payload 
                                    + sizeof(struct ip));
     struct ip *ip_hdr = (struct ip*)payload;
@@ -402,10 +487,11 @@ void sr_handle_pwospf(struct sr_instance *sr, uint8_t* payload,
     switch(err_rsp_no)
     {
         case ERR_RSP_OSPF_HELLO:
-                err_rsp_no = log_hello_pkt(sr, payload, interface);
+                err_rsp_no = log_hello_pkt(sr, packet, len, interface);
                 break;
         case ERR_RSP_OSPF_LSU: 
-                err_rsp_no = log_lsu_pkt(sr, payload, interface);
+                err_rsp_no = log_lsu_pkt(sr, packet, len, interface);
+                printGraph(subnetGraph);
                 break;
     }
     printf("\nOSPF pkt received from %s", interface);
@@ -527,6 +613,8 @@ void* periodic_lsu_handler(void* arg)
     struct ospfv2_lsu_hdr *lsu_hdr;
     struct ospfv2_lsu *lsa, *lsa_pkt;
 
+    uint32_t tmp;
+
     while(1)
     {
         pthread_mutex_lock(&mutex);
@@ -604,7 +692,9 @@ void* periodic_lsu_handler(void* arg)
             {
                 lsa[i].subnet = lsa_walker->ip & lsa_walker->mask;
                 lsa[i].mask = lsa_walker->mask;
-                lsa[i].rid = rid;
+
+                tmp = getNeighborRid(lsa[i].subnet);
+                lsa[i].rid = tmp;
 
                 lsa_walker = lsa_walker->next;
                 ++i;
@@ -622,7 +712,7 @@ void* periodic_lsu_handler(void* arg)
             walker = walker->next;
         }
         pthread_mutex_unlock(&mutex);
-        sleep(2);//OSPF_DEFAULT_LSUINT);
+        sleep(OSPF_DEFAULT_LSUINT);
         lsu_seq++;
     }
     return NULL;
@@ -677,7 +767,6 @@ int pwospf_init(struct sr_instance* sr)
         isUp[i] = ALIVE;
         initNeighbor(i);
     }
-    printf("\nRouter Id is %p ip is %s", rid, inet_ntoa(*(struct in_addr*)&rid));
 
     subnetGraph = initGraph();
     initCurrentRouter(subnetGraph);
@@ -728,6 +817,7 @@ void* pwospf_run_thread(void* arg)
 
         pwospf_lock(sr->ospf_subsys);
         //printf(" pwospf subsystem sleeping \n");
+        pthread_mutex_lock(&mutex);
         printf("\nNeighbors ");
         printf("\nRID\t\tIP\t\tIface");
                 
@@ -741,9 +831,7 @@ void* pwospf_run_thread(void* arg)
             }
         }
 
-        printGraph(subnetGraph);
-
-
+        pthread_mutex_unlock(&mutex);
         pwospf_unlock(sr->ospf_subsys);
         sleep(2);
         //printf(" pwospf subsystem awake \n");

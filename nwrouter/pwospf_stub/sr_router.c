@@ -740,7 +740,7 @@ int sr_handle_ether_frame(uint8_t dhost[ETHER_ADDR_LEN],
                         err_rsp_no = sr_ip_forwarding(sr, dhost, payload, interface, next_hop);
 
                     /* Let pwospf handle this */
-                    else sr_handle_pwospf(sr, payload, *interface);
+                    else return ERR_RSP_OSPF_PKT;
                     break;
         default : err_rsp_no = -1; break;
         }
@@ -818,6 +818,9 @@ void sr_handlepacket(struct sr_instance* sr,
                        type, payload,
                        sr, &toInterface,
                        &next_hop);
+
+    if(err_rsp_no == ERR_RSP_OSPF_PKT)
+        sr_handle_pwospf(sr, packet, len, interface);
     
     /* Pass on what to do with the packet */
     pthread_mutex_lock(&count_mutex);

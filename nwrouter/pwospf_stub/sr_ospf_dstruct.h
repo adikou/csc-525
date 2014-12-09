@@ -10,9 +10,9 @@ struct sr_ospf_neighbor
 {
 	uint32_t rid;
 	uint32_t ip;
+	uint32_t nmask;
 	char *iface;
 	int isAlive;
-	int latestSeqNum;
 	double tstamp;
 };
 
@@ -47,6 +47,7 @@ struct vertex
 	int type;
 	uint32_t subnet;
 	int d, parent;
+	int latestSeqNum;
 	struct adjList *head;
 };
 

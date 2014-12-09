@@ -27,15 +27,17 @@
 #define ERR_RSP_ICMP_TOUT	  10
 #define ERR_RSP_ICMP_ECHO_REP 11
 
-#define ERR_RSP_OSPF_HELLO	  12
-#define ERR_RSP_OSPF_LSU	  13
-#define ERR_RSP_OSPF_VER	  14
-#define ERR_RSP_OSPF_CSUM	  15
-#define ERR_RSP_OSPF_AID	  16
-#define ERR_RSP_OSPF_AUTYPE	  17
-#define ERR_RSP_OSPF_TYPE	  18
-#define ERR_RSP_OSPF_IP_DST	  19
-#define ERR_RSP_OSPF_HEL_NM	  20
-#define ERR_RSP_OSPF_HEL_HI	  21
+#define ERR_RSP_OSPF_PKT	  12
+#define ERR_RSP_OSPF_HELLO	  13
+#define ERR_RSP_OSPF_LSU	  14
+#define ERR_RSP_OSPF_VER	  15
+#define ERR_RSP_OSPF_CSUM	  16
+#define ERR_RSP_OSPF_AID	  17
+#define ERR_RSP_OSPF_AUTYPE	  18
+#define ERR_RSP_OSPF_TYPE	  19
+#define ERR_RSP_OSPF_IP_DST	  20
+#define ERR_RSP_OSPF_HEL_NM	  21
+#define ERR_RSP_OSPF_HEL_HI	  22
+#define ERR_RSP_OSPF_LSU_DROP 23 
 
 #endif /* SR_ERR_RSP_H  */
