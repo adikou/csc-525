@@ -4,6 +4,7 @@
 #include "sr_arp_cache.h"
 
 /* ARP-related methods */
+void fill_arp_cache(struct sr_instance*);
 void print_arp_cache();
 void add_arp_cache_tuple(struct sr_arp_cache*);
 int  walk_arp_cache(struct sr_arp_cache*);
@@ -32,6 +33,7 @@ void sr_print_packet_contents(struct sr_instance*, uint8_t*,
 void print_ethernet_address(uint8_t *);
 
 /*PWOSPF methods*/
+int getIndex(char*);
 long int getProperty(char*);
 void sr_handle_pwospf(struct sr_instance*, uint8_t*, int, char*);
 

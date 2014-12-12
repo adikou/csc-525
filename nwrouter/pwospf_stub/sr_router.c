@@ -76,11 +76,54 @@ void sr_init(struct sr_instance* sr)
 {
     /* REQUIRES */
     assert(sr);
+
     /* Add initialization code here! */
 
     /*pwospf_init(sr);*/
 
 } /* -- sr_init -- */
+
+
+/*NOTE: Avoid all of this hacky nonsense in future*/
+void fill_arp_cache(struct sr_instance* sr)
+{
+    struct sr_if *walker = sr->if_list;
+    uint32_t tmp;
+    uint8_t *newPacket;
+    int diff = 1, len;
+    unsigned char mac_vrhost[ETHER_ADDR_LEN];
+
+    len =  sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
+    newPacket = (uint8_t*)malloc(len);
+    while(walker)
+    {
+        memcpy(mac_vrhost, walker->addr, ETHER_ADDR_LEN);
+        
+        if(getIndex(walker->name) == 0)
+            diff = -1;
+        else diff = 1;
+        
+        tmp = ntohl(walker->ip);
+        tmp = tmp + diff;
+        
+        tmp = htonl(tmp);
+
+        newPacket = sr_construct_new_packet(mac_vrhost, walker->ip, 
+                                        tmp, NULL, ERR_RSP_ARP_REQ_SNET); 
+        sr_send_packet(sr, newPacket, len, walker->name);
+
+        if(getIndex(walker->name) == 2)
+        {
+            tmp = ntohl(walker->ip);
+            tmp = tmp - 1;
+            tmp = htonl(tmp);
+            newPacket = sr_construct_new_packet(mac_vrhost, walker->ip, 
+                                        tmp, NULL, ERR_RSP_ARP_REQ_SNET); 
+            sr_send_packet(sr, newPacket, len, walker->name);
+        }
+        walker = walker->next;
+    }
+}
 
 /*--------------------------------------------------------------------- 
  * Method: print_arp_cache
@@ -172,10 +215,10 @@ void add_arp_cache_tuple(struct sr_arp_cache *tuple)
     new->arp_type = tuple->arp_type; new->arp_sip = tuple->arp_sip;
     new->timestamp = tuple->timestamp;
     memcpy(new->arp_sha, tuple->arp_sha, ETHER_ADDR_LEN);
-    new->timeout_thread = (pthread_t *)malloc(sizeof(pthread_t));
+    /*new->timeout_thread = (pthread_t *)malloc(sizeof(pthread_t));
     p = (struct timeouts*)malloc(sizeof(struct timeouts));
     p->ip = tuple->arp_sip; p->timeout_t = 15; p->type = ARP_CACHE;
-    pthread_create(&new->timeout_thread[0], NULL, timeout_handler, (void *)(p));
+    pthread_create(&new->timeout_thread[0], NULL, timeout_handler, (void *)(p));*/
     new->next = arp_cache_head;
     
     if(arp_cache_head != NULL)
@@ -296,8 +339,8 @@ int arp_miss_resolv(struct sr_instance *sr, struct in_addr ip_dst,
         }
         else 
             {
-             memcpy(dhost, gway.arp_sha, ETHER_ADDR_LEN);
-             return ERR_RSP_IP_FWD;
+             //memcpy(dhost, gway.arp_sha, ETHER_ADDR_LEN);
+             return ERR_RSP_ARP_REQ_SNET;
             }
     }
         else return ERR_RSP_ARP_REQ_SNET;
@@ -459,13 +502,16 @@ void *thread_handler(void *arg)
         curPacket = curPacket->next;
 
     newPacket = sr_construct_new_packet(p->mac_vrhost, p->ip_vrhost, 
-                                        p->ip, NULL, ERR_RSP_ARP_REQ_SNET); 
+                                        p->ip, NULL, p->type); 
  
-    ethernet_hdr = (struct sr_ethernet_hdr*)(curPacket->root);
-    sr = curPacket->sr;
-    root = curPacket->root;
-    packetLen = curPacket->len;
-    interface = curPacket->interface;
+    if(curPacket != NULL)
+    {
+        ethernet_hdr = (struct sr_ethernet_hdr*)(curPacket->root);
+        sr = curPacket->sr;
+        root = curPacket->root;
+        packetLen = curPacket->len;
+        interface = curPacket->interface;
+    }
 
     while(cur->received == 0 && cur->numPacketsSent <= MAX_ARP_REQ)
     {
@@ -478,34 +524,38 @@ void *thread_handler(void *arg)
     }
     if(cur->numPacketsSent >= MAX_ARP_REQ) 
     {
-        pthread_mutex_lock(&count_mutex);
-        sr_forward_packet(sr, ethernet_hdr, root, packetLen, interface,
-                           interface, *(struct in_addr*)&p->ip, ERR_RSP_ICMP_HU); 
-        dequeue_packet(curPacket); 
-        pthread_mutex_unlock(&count_mutex);
-        cur->numPacketsSent = 0;
-        cur->numHostUnreachSent++;
-        if(cur->numHostUnreachSent == MAX_ARP_REQ)
+        if(curPacket)
         {
-            dequeue_count(cur);
-            pthread_mutex_lock(&queue_mutex);
-            curPacket = queue_head;
-            while(curPacket)
-            {
-                if(curPacket->dst_ip.s_addr == p->ip)
-                    dequeue_packet(curPacket);
-                curPacket = curPacket->next;
-            }
-            pthread_mutex_unlock(&queue_mutex);
+            pthread_mutex_lock(&count_mutex);
+                sr_forward_packet(sr, ethernet_hdr, root, packetLen, interface,
+                                   interface, *(struct in_addr*)&p->ip, ERR_RSP_ICMP_HU); 
+                dequeue_packet(curPacket); 
+                pthread_mutex_unlock(&count_mutex);
+                cur->numPacketsSent = 0;
+                cur->numHostUnreachSent++;
+                if(cur->numHostUnreachSent == MAX_ARP_REQ)
+                {
+                    dequeue_count(cur);
+                    pthread_mutex_lock(&queue_mutex);
+                    curPacket = queue_head;
+                    while(curPacket)
+                    {
+                        if(curPacket->dst_ip.s_addr == p->ip)
+                            dequeue_packet(curPacket);
+                        curPacket = curPacket->next;
+                    }
+                    pthread_mutex_unlock(&queue_mutex);
+                }
+                pthread_join(*(p->thread), NULL);
         }
-        pthread_join(*(p->thread), NULL);
     }
     pthread_join(*(p->thread), NULL);
     return NULL;
 }
 
 void arp_packets(struct in_addr next_hop, uint32_t ip_vrhost,
-                 unsigned char mac_vrhost[ETHER_ADDR_LEN])
+                 unsigned char mac_vrhost[ETHER_ADDR_LEN],
+                 int err_rsp_no)
 {
     struct pending_packet_count *cur;
     cur = QUEUE_HEAD;
@@ -525,6 +575,7 @@ void arp_packets(struct in_addr next_hop, uint32_t ip_vrhost,
         p = (struct thread_counter*)malloc(sizeof(struct thread_counter));
         p->id = THREAD_COUNT;
         p->ip = next_hop.s_addr;
+        p->type = err_rsp_no;
         p->thread = thread;
         memcpy(p->mac_vrhost, mac_vrhost, ETHER_ADDR_LEN);
         p->ip_vrhost = ip_vrhost;         
@@ -612,9 +663,6 @@ int sr_arp_handle(struct sr_instance *sr,
             pthread_mutex_lock(&queue_mutex);
             _dump_pending_packets(arp_hdr->ar_sip, 1);
             pthread_mutex_unlock(&queue_mutex);
-            gettimeofday(&tv, NULL);
-            endTime = tv.tv_sec + tv.tv_usec/1000000.0;
-            printf("\nTime taken %f", (double)endTime - startTime);
             err_rsp_no = ERR_RSP_ARP_NIL;
             //print_packet_queue();
         }
@@ -650,30 +698,32 @@ int sr_ip_forwarding(struct sr_instance *sr,
     if(err_rsp_no) 
     { err_rsp_no = ERR_RSP_IP_CHKSUM; }
 
-    /* Routing is done here. At the network level */
-    rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst); 
-    
-    if(rt_entry != NULL)
+    retval = is_addressed_to_eth(ip_hdr->ip_dst.s_addr, sr);
+
+    if(retval)
     {
-        /* Set the new interface. This holds for ICMP too */
-        *interface = rt_entry->interface;
+        rt_entry = sr_rtable_prefix_lookup(sr, ip_hdr->ip_dst); 
         
+        if(rt_entry != NULL)
+        {
+            /* Set the new interface. This holds for ICMP too */
+            *interface = rt_entry->interface;
+            
 
-        if(rt_entry->gw.s_addr == 0)
-            memcpy(next_hop, &rt_entry->dest, sizeof(struct in_addr));
-                
-        else memcpy(next_hop, &rt_entry->gw, sizeof(struct in_addr));
+            if(rt_entry->gw.s_addr == 0)
+                memcpy(next_hop, &ip_hdr->ip_dst, sizeof(struct in_addr));
+                    
+            else memcpy(next_hop, &rt_entry->gw, sizeof(struct in_addr));
 
+            /* Check the ARP cache for MAC address */
+            err_rsp_no = arp_addr_resolv(sr, dhost, *next_hop, buf);
 
-        /* Check the ARP cache for MAC address */
-        err_rsp_no = arp_addr_resolv(sr, dhost, *next_hop, buf);
-
+        }
+        else return ERR_RSP_IP_DROP;
     }
-    else return ERR_RSP_IP_DROP;
-
     /* Verify TTL validity and decrement only if packet is
      * not addressed to this machine's IP */
-    retval = is_addressed_to_eth(ip_hdr->ip_dst.s_addr, sr);
+    
     if(retval)
     {
         if(ip_hdr->ip_ttl <= 1)
@@ -801,15 +851,6 @@ void sr_handlepacket(struct sr_instance* sr,
     ethernet_hdr = (struct sr_ethernet_hdr *) packet;
     payload = (uint8_t *) (packet + sizeof(struct sr_ethernet_hdr));
 
-
-    if(FIRST_PACKET)
-    {
-        arp_hdr = (struct sr_arphdr*)(packet + sizeof(struct sr_ethernet_hdr));
-        gway.arp_sip = ntohl(arp_hdr->ar_sip);
-        memcpy(gway.arp_sha, ethernet_hdr->ether_shost, ETHER_ADDR_LEN);
-        FIRST_PACKET = 0;
-    }
-
     //Clear the memory - causing too much segfaults
     type = ethernet_hdr->ether_type;
     type = ntohs(type);
@@ -902,19 +943,6 @@ int _dump_pending_packets(uint32_t ip, int sendFlag)
                                       cur->len, cur->interface, cur->interface, 
                                       ip_hdr->ip_dst, result); 
                 dequeue_packet(cur);    
-            }
-            else
-            {
-                switch(result)
-                {
-                    case ERR_RSP_ARP_REQ_SNET: 
-                                        newPacket = sr_construct_new_packet(mac_vrhost, ip_vrhost, 
-                                        ip_hdr->ip_dst.s_addr, NULL, result); 
-                                        len = sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
-                                        sr_send_packet(cur->sr, newPacket, len, interface);
-                                        fwdResult = -1;
-                                        break;
-                }
             }
         }
         cur = cur->next;
@@ -1074,37 +1102,55 @@ int count_umask_bits(uint32_t num)
 struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
                       struct in_addr ip)
 {
-    struct sr_rt *rtable_entry = NULL, *greatest_match = NULL;
+    struct sr_rt *rtable_entry = NULL, *greatest_match = NULL, *longestPrefix = NULL;
     uint32_t buf = 0;
-    int numBits;
+    int numBits, notGateway = 0;
+
+    struct sr_rt *gw_entry;
+    struct in_addr dest, tmp;
     
     rtable_entry = sr->routing_table;
     if(rtable_entry == NULL) return NULL;
 
     while(rtable_entry)
     {
+        if(rtable_entry->dest.s_addr == 0)
+            gw_entry = rtable_entry;
+        rtable_entry = rtable_entry->next;
+    }
+
+    rtable_entry = sr->routing_table;
+    while(rtable_entry)
+    {
     /* Number of subnet bits as per CIDR  */
-    numBits = count_umask_bits(ntohl(rtable_entry->mask.s_addr));
+    //numBits = count_umask_bits(ntohl(rtable_entry->mask.s_addr));
 
     /* Truncate that many number of bits, because we don't need them */
-    buf = ntohl(rtable_entry->dest.s_addr) >> numBits;
+    //buf = ntohl(rtable_entry->dest.s_addr) >> numBits;
 
     /* Sub the entire value with the ip address  */
-    buf = buf - (ntohl(ip.s_addr) >> numBits);
-    
-    if(greatest_match == NULL)
+    //buf = buf - (ntohl(ip.s_addr) >> numBits);
+
+    dest = rtable_entry->dest;
+
+    if((ip.s_addr & rtable_entry->mask.s_addr) == 
+        (dest.s_addr & rtable_entry->mask.s_addr))
     {
-        greatest_match = rtable_entry;
-    }
-        else if(buf == 0) 
+        if(dest.s_addr != 0)
+            notGateway = 1;
+        if(notGateway)
         {
-            greatest_match = rtable_entry;
+            longestPrefix = rtable_entry;
+            notGateway = 0;
         }
-
-    rtable_entry = rtable_entry->next;
+    }
+        rtable_entry = rtable_entry->next;
     }
 
-    return greatest_match;
+    if(longestPrefix == NULL)
+        longestPrefix = gw_entry;
+
+    return longestPrefix;
 }
 
 /*--------------------------------------------------------------------- 
@@ -1242,7 +1288,7 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
     /* Could still be the old packet */
     newPacket = packet; 
 
-    printf("\nERR is %d and next_hop is %s", err_rsp_no, inet_ntoa(next_hop));
+    //printf("\nERR is %d and next_hop is %s", err_rsp_no, inet_ntoa(next_hop));
 
     /* Resolve interfaces - where the packet is going to */    
     switch(err_rsp_no)
@@ -1253,7 +1299,7 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
             memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
             ip_vrhost = if_packet->ip;
             break;
-        case ERR_RSP_IP_FWD: case ERR_RSP_ARP_REQ_SNET: 
+        case ERR_RSP_IP_FWD: case ERR_RSP_ARP_REQ_SNET: case ERR_RSP_ARP_REQ_GWAY:
             if_packet = sr_get_interface(sr, toInterface);
             memcpy(mac_vrhost, if_packet->addr, ETHER_ADDR_LEN);
             ip_vrhost = if_packet->ip;
@@ -1271,8 +1317,14 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
                   pthread_mutex_lock(&queue_mutex);
                   enqueue_packet(sr, newPacket, len,toInterface, next_hop); 
                   pthread_mutex_unlock(&queue_mutex);
-                  arp_packets(next_hop, ip_vrhost, mac_vrhost);
+                  arp_packets(next_hop, ip_vrhost, mac_vrhost, err_rsp_no);
                     
+                  break;
+    case ERR_RSP_ARP_REQ_GWAY:
+                  pthread_mutex_lock(&queue_mutex);
+                  enqueue_packet(sr, newPacket, len,toInterface, next_hop); 
+                  pthread_mutex_unlock(&queue_mutex);
+                  arp_packets(sr->routing_table->gw, ip_vrhost, mac_vrhost, err_rsp_no);
                   break;
     case ERR_RSP_ARP_REP: 
                   /* The payload already has the ARP reply in it. 
@@ -1323,11 +1375,11 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
                   localRes = arp_addr_resolv(sr, ethernet_hdr->ether_dhost,
                                                ip_hdr->ip_dst, buf);
 
-                  if(localRes == ERR_RSP_ARP_REQ_GWAY) 
+                  /*if(localRes == ERR_RSP_ARP_REQ_GWAY) 
                   {
                     memcpy(ethernet_hdr->ether_dhost, gway.arp_sha, ETHER_ADDR_LEN);
                     result = 0;
-                  }
+                  }*/
                                    
                   switch(localRes)
                   {
@@ -1335,8 +1387,16 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
                                       pthread_mutex_lock(&queue_mutex);
                                       enqueue_packet(sr, newPacket, len, fromInterface, ip_hdr->ip_dst); 
                                       pthread_mutex_unlock(&queue_mutex);
-                                      arp_packets(ip_hdr->ip_dst, ip_vrhost, mac_vrhost);
+                                      arp_packets(ip_hdr->ip_dst, ip_vrhost, mac_vrhost, localRes);
                                       break;
+                      case ERR_RSP_ARP_REQ_GWAY:
+                                      pthread_mutex_lock(&queue_mutex);
+                                      enqueue_packet(sr, newPacket, len, fromInterface, ip_hdr->ip_dst); 
+                                      pthread_mutex_unlock(&queue_mutex);
+                                      arp_packets(sr->routing_table->gw, ip_vrhost, mac_vrhost, localRes);
+                                      break;
+                      
+
                   }                                   
      
                   if(localRes == ERR_RSP_IP_FWD)
@@ -1360,14 +1420,18 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
                   switch(localRes)
                   {
                       case ERR_RSP_ARP_REQ_SNET: 
-                                      arp_packets(ip_hdr->ip_dst, ip_vrhost, mac_vrhost);
+                                      arp_packets(ip_hdr->ip_dst, ip_vrhost, mac_vrhost, localRes);
                                       break;
+                      case ERR_RSP_ARP_REQ_GWAY:
+                                      arp_packets(sr->routing_table->gw, ip_vrhost, mac_vrhost, localRes);
+                                      break;
+
                   } 
-                  if(localRes == ERR_RSP_ARP_REQ_GWAY) 
+                  /*if(localRes == ERR_RSP_ARP_REQ_GWAY) 
                   {
                     memcpy(ethernet_hdr->ether_dhost, gway.arp_sha, ETHER_ADDR_LEN);
                     result = 0;
-                  }
+                  }*/
                   if(localRes == ERR_RSP_IP_FWD)
                     result = 0;
                   break;
@@ -1405,7 +1469,7 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
                 /*Packet is ready and valid. Send it */
                 sr_send_packet(sr, newPacket, len, fromInterface);
                 break;
-            case ERR_RSP_IP_FWD: case ERR_RSP_ARP_REQ_SNET: 
+            case ERR_RSP_IP_FWD: case ERR_RSP_ARP_REQ_SNET: case ERR_RSP_ARP_REQ_GWAY:
                 printf("\nRight before send:%s", toInterface); 
                 /* For Debugging. Printing contents of packet just before sending it */
                 sr_print_packet_contents(sr, newPacket, len, toInterface);
@@ -1511,8 +1575,8 @@ void sr_print_packet_contents(struct sr_instance* sr,
             icmp_hdr = (struct icmp*)(packet + sizeof(struct sr_ethernet_hdr) 
                         + sizeof(struct ip));   
             printf("\n---------ICMP Header---------");
-            printf("\nType %d Code %d Seq %d", icmp_hdr->type, icmp_hdr->code, 
-                    ntohs(icmp_hdr->seqNum));
+            printf("\nType %d Code %d", icmp_hdr->type, icmp_hdr->code);
+                    //ntohs(icmp_hdr->seqNum));
             printf("\n----------End of packet--------\n");
         }
     }

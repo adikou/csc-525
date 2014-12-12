@@ -5,6 +5,9 @@
 
 static const int VTYPE_ROUTER = 0;
 static const int VTYPE_SUBNET = 1;
+static const int INF = 5;
+static const int VISITED = 1;
+static const int UNVISITED = 0;
 
 struct sr_ospf_neighbor
 {
@@ -14,15 +17,6 @@ struct sr_ospf_neighbor
 	char *iface;
 	int isAlive;
 	double tstamp;
-};
-
-/*Heap data structure for dijkstra*/
-
-struct heap
-{
-	int *A;
-	int heap_size;
-	int length;
 };
 
 /*Graph  data structures*/
@@ -46,7 +40,9 @@ struct vertex
 	uint32_t id;
 	int type;
 	uint32_t subnet;
+	uint32_t nmask;
 	int d, parent;
+	int visited;
 	int latestSeqNum;
 	struct adjList *head;
 };
@@ -57,23 +53,24 @@ struct vertexList
 	struct vertexList *next;
 };
 
+struct path
+{
+	struct vertex v;
+	struct path *next;
+};
+
 struct graph
 {
 	int V;
 	struct vertexList *vList;
 };
 
-int parent(int);
-int left(int);
-int right(int);
-void min_heapify(struct heap*, int);
-int extrace_min(struct heap*);
-
 struct graph* initGraph();
-void addVertex(struct graph *, uint32_t, uint32_t, int);
+
+void addVertex(struct graph *, uint32_t, uint32_t, uint32_t, int);
 void addEdge(struct vertexList *, struct vertexList*, int);
-void initSingleSource(struct graph *, int);
-void relax(struct graph*, struct edge *);
-void dijkstra(struct graph*, int);
+void initSingleSource(struct graph *, struct vertexList*);
+void relax(struct vertexList*, struct vertexList*, int);
+void dijkstra(struct graph*, struct vertexList*);
 
 #endif

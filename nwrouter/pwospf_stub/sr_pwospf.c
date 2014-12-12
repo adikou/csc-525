@@ -12,6 +12,7 @@
 #include "sr_router.h"
 #include "sr_err_rsp.h"
 #include "sr_if.h" 
+#include "sr_rt.h"
 #include "pwospf_protocol.h"
 
 /* Custom headers */
@@ -85,51 +86,93 @@ void swap(int *a, int *b)
     *b = tmp;
 }
 
-
-int parent(int i)
+void insert(struct path *S, struct vertexList *u)
 {
-    return floor(i/2) - 1;
+    struct path* new = (struct path*)malloc(sizeof(struct path));
+    memcpy(&new->v, &u->v, sizeof(struct vertex));
+    new->next = S;
+    S = new;
 }
 
-int left(int i)
+struct vertexList* getVertex(struct graph *G, int id)
 {
-    return 2 * i + 1;
-}
-
-int right(int i)
-{
-    return 2*i + 2;
-}
-
-void min_heapify(struct heap *A, int i)
-{
-    int l, r, smallest;
-    l = left(i);
-    r = right(i);
-
-    if(l <= A->heap_size && A->A[l] < A->A[i])
-        smallest = l;
-    else smallest = i;
-    if(r <= A->heap_size && A->A[r] < A->A[i])
-        smallest = r;
-
-    if(smallest != i)
+    struct vertexList *vlWalker = subnetGraph->vList;
+    while(vlWalker)
     {
-        swap(&(A->A[i]), &(A->A[smallest]));
-        min_heapify(A, smallest);
+        if(vlWalker->v.id == id)
+            return vlWalker;
+        vlWalker = vlWalker->next;
+    }
+
+    return NULL;   
+}
+
+void initSingleSource(struct graph *subnetGraph, struct vertexList *source)
+{
+    struct vertexList *v;
+    v = subnetGraph->vList;
+    while(v)
+    {
+        v->v.d = INF;
+        v->v.parent = -1;
+        v->v.visited = UNVISITED;
+        v = v->next;
+    }
+    source->v.d = 0;
+}
+
+struct vertexList* extract_min(struct vertexList *Q)
+{
+    int least = INF+1;
+    struct vertexList *tmp = NULL;
+    while(Q)
+    {
+        if(Q->v.visited == UNVISITED)
+        {
+            if(Q->v.d < least)
+            {
+               least = Q->v.d;
+               tmp = Q;
+            }
+        }
+        Q = Q->next;
+    }
+    return tmp;
+}
+
+void relax(struct vertexList*u, struct vertexList *v, int w)
+{
+    if(v->v.d > u->v.d + w)
+    {
+        v->v.d = u->v.d + w;
+        v->v.parent = u->v.id;
     }
 }
 
-int extract_min(struct heap *A)
+void dijkstra(struct graph* G, struct vertexList *s)
 {
-    int min;
-    if(A->heap_size < 0)
-        return -1;
-    min = A->A[0];
-    A->A[0] = A->A[A->heap_size - 1];
-    A->heap_size--;
-    min_heapify(A, 0);
-    return min;
+    struct vertexList *Q, *v, *u;
+    initSingleSource(subnetGraph, s);
+    struct path *S = NULL;
+    struct adjList *e;
+    Q = G->vList;
+    while(Q != NULL)
+    {
+        u = extract_min(G->vList);
+        if(u)
+        {
+            u->v.visited = VISITED;
+            insert(S, u);
+            e = u->v.head;
+            while(e)
+            {
+                v = getVertex(G, e->e.to);
+                relax(u, v, e->e.weight);
+                e = e->next;
+            }
+        }
+        Q = Q->next;
+    }
 }
 
 struct graph* initGraph()
@@ -150,9 +193,11 @@ void printGraph(struct graph *subnetGraph)
         struct adjList *cur = i->v.head;
         printf("\nAdjacency list of vertex %d rid %s ", i->v.id
                     ,inet_ntoa(*(struct in_addr*)&i->v.rid)); 
-        printf("snet %s type %d \nroot "
+        printf("snet %s type %d d=%d parent=%d root "
                     ,inet_ntoa(*(struct in_addr*)&i->v.subnet)
-                    ,i->v.type);
+                    ,i->v.type
+                    ,i->v.d
+                    ,i->v.parent);
         while (cur)
         {
             printf("-> %d", cur->e.to); 
@@ -208,7 +253,8 @@ struct vertexList* getNodeBySubnet(struct graph *subnetGraph, uint32_t subnet, u
     return NULL;
 }
 
-void addVertex(struct graph *subnetGraph, uint32_t rid, uint32_t subnet, int type)
+void addVertex(struct graph *subnetGraph, uint32_t rid, uint32_t subnet, 
+               uint32_t nmask, int type)
 {
     struct vertexList *vl;
     vl = (struct vertexList*)malloc(sizeof(struct vertexList));
@@ -216,8 +262,10 @@ void addVertex(struct graph *subnetGraph, uint32_t rid, uint32_t subnet, int typ
     vl->v.id = vid++;
     vl->v.rid = rid;
     vl->v.subnet = subnet;
+    vl->v.nmask = nmask;
     vl->v.latestSeqNum = 0;
     vl->v.type = type;
+    vl->v.visited = 0;
     vl->v.head = NULL;
     vl->next = subnetGraph->vList;
     subnetGraph->vList = vl;
@@ -236,17 +284,30 @@ void addEdge(struct vertexList *v, struct vertexList *w, int weight)
 
 void initCurrentRouter(struct graph *subnetGraph)
 {
-    addVertex(subnetGraph, rid, 0, VTYPE_ROUTER);
+    addVertex(subnetGraph, rid, 0, 0, VTYPE_ROUTER);
 }
 
 void addIfaceVertices(struct graph *subnetGraph, struct sr_instance *sr)
 {
     struct sr_if *walker = sr->if_list;
     struct vertexList *r = getRouterByRid(subnetGraph, rid);
+
+    struct in_addr dest_addr;
+    struct in_addr gw_addr;
+    struct in_addr mask_addr;
+
     while(walker)
     {
-        addVertex(subnetGraph, rid, walker->ip & walker->mask, VTYPE_SUBNET);
+        addVertex(subnetGraph, rid, walker->ip & walker->mask, 
+                  walker->mask, VTYPE_SUBNET);
         addEdge(r, subnetGraph->vList, 1);
+
+        dest_addr.s_addr = walker->ip & walker->mask;
+        gw_addr.s_addr = 0;
+        mask_addr.s_addr = walker->mask;
+
+        sr_add_rt_entry(sr,dest_addr,gw_addr,
+                                mask_addr,walker->name);        
         walker = walker->next;
     }
 }
@@ -259,6 +320,22 @@ long int getProperty(char *propName)
         return rid;
 
     return -1;
+}
+
+int getNeighbor(uint32_t rid)
+{
+    int i = 0;
+    for(i = 0; i < numInterfaces; ++i)
+    {
+        if(neighbors[i].rid == rid)
+        {
+            if(neighbors[i].isAlive == ALIVE)
+            {
+                return i;
+            }
+        }
+    }
+    return 0;
 }
 
 uint32_t getNeighborRid(uint32_t subnet)
@@ -300,11 +377,58 @@ int getIndex(char *iface)
     return iface[3] - (int)'0';
 }
 
+
+void populateRoutingTable(struct graph* G, struct sr_instance *sr)
+{
+    struct in_addr dest_addr;
+    struct in_addr gw_addr;
+    struct in_addr mask_addr;
+
+    struct vertexList *walker = G->vList, *u;
+    struct sr_rt *cur = sr->routing_table;
+
+    int idx, flag = 10, i;
+    while(walker)
+    {
+        if(walker->v.type == VTYPE_SUBNET)
+        {
+            u = getVertex(G, walker->v.parent);
+            if(u != NULL)
+            {
+                idx = getNeighbor(u->v.rid);
+                dest_addr.s_addr = walker->v.subnet;
+                gw_addr.s_addr = neighbors[idx].ip;
+                mask_addr.s_addr = walker->v.nmask;
+
+                cur = sr->routing_table;
+                while(cur)
+                {
+                    if(cur->dest.s_addr == walker->v.subnet)
+                        flag = 0;
+                    cur = cur->next;
+                }
+                if(flag)
+                {
+                    sr_add_rt_entry(sr,dest_addr,gw_addr,
+                                mask_addr,neighbors[idx].iface);
+                   
+                }
+                else flag  = 10;
+            }
+        }
+
+        walker = walker->next;
+    }
+
+}
+
+
 int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
                     int len,
                       char* interface)
 {
     uint8_t *payload = (uint8_t*)(packet + sizeof(struct sr_ethernet_hdr));
+    uint8_t *newPacket;
     struct sr_if *walker;
     struct ip *ip_hdr = (struct ip*)payload;
     struct ospfv2_hdr *ospf_hdr = (struct ospfv2_hdr*)(payload 
@@ -313,7 +437,14 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
                     (struct ospfv2_hello_hdr*)(payload + sizeof(struct ip)
                                                + sizeof(struct ospfv2_hdr));
     int idx = getIndex(interface);
+    int arplen = sizeof(struct sr_ethernet_hdr) + sizeof(struct sr_arphdr);
+    
+    unsigned char mac_vrhost[ETHER_ADDR_LEN];
+
+    newPacket = (uint8_t*)malloc(arplen);
+
     walker = sr_get_interface(sr, interface);
+    
     if(hello_packet->nmask != walker->mask)
         return ERR_RSP_OSPF_HEL_NM;
     else if(ntohs(hello_packet->helloint) != OSPF_DEFAULT_HELLOINT)
@@ -321,6 +452,8 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
 
     if(neighbors[idx].rid == 0)
     {
+        memcpy(mac_vrhost, walker->addr, ETHER_ADDR_LEN);
+
         neighbors[idx].rid = ospf_hdr->rid;
         neighbors[idx].ip = ip_hdr->ip_src.s_addr;
         neighbors[idx].nmask = hello_packet->nmask;
@@ -328,6 +461,11 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
         curTime = tv.tv_sec;
         neighbors[idx].isAlive = ALIVE;
         neighbors[idx].tstamp = curTime;
+
+        newPacket = sr_construct_new_packet(mac_vrhost, walker->ip, 
+                                        neighbors[idx].ip, NULL, 
+                                        ERR_RSP_ARP_REQ_SNET); 
+        sr_send_packet(sr, newPacket, arplen, walker->name);
     }
     else
     {
@@ -354,7 +492,7 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
                                   + sizeof(struct ip));
     struct ospfv2_lsu_hdr *lsu_hdr;
     struct ospfv2_lsu *lsa, *lsa_pkt;
-    struct vertexList *v, *w, *tmp;
+    struct vertexList *v, *w, *tmp, *s;
 
     struct sr_ethernet_hdr *ethernet_hdr;
     unsigned char mac_src[ETHER_ADDR_LEN];
@@ -385,14 +523,15 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
 
     if(getRouterByRid(subnetGraph, ospf_hdr->rid) == NULL)
     {
-        addVertex(subnetGraph, ospf_hdr->rid, 0, VTYPE_ROUTER);
+        addVertex(subnetGraph, ospf_hdr->rid, 0, 0, VTYPE_ROUTER);
         tmp = getRouterByRid(subnetGraph, ospf_hdr->rid);
         tmp->v.latestSeqNum = ntohs(lsu_hdr->seq);
     }
     for(i = 0; i < numAdv; ++i)
     {
         if(getNodeBySubnet(subnetGraph, lsa[i].subnet, ospf_hdr->rid) == NULL)
-            addVertex(subnetGraph, ospf_hdr->rid, lsa[i].subnet, VTYPE_SUBNET);
+            addVertex(subnetGraph, ospf_hdr->rid, lsa[i].subnet, 
+                      lsa[i].mask, VTYPE_SUBNET);
 
         v = getRouterByRid(subnetGraph, ospf_hdr->rid);
         w = getNodeBySubnet(subnetGraph, lsa[i].subnet, ospf_hdr->rid);
@@ -403,7 +542,7 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
         if(lsa[i].rid != 0)
         {
             if(getRouterByRid(subnetGraph, lsa[i].rid) == NULL)
-                addVertex(subnetGraph, lsa[i].rid, 0, VTYPE_ROUTER);
+                addVertex(subnetGraph, lsa[i].rid, 0, 0, VTYPE_ROUTER);
         }
 
         v = getRouterByRid(subnetGraph, ospf_hdr->rid);
@@ -439,6 +578,17 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
             walker = walker->next;
         }
     }
+    s = getRouterByRid(subnetGraph, rid);
+    //printGraph(subnetGraph);
+    dijkstra(subnetGraph, s);
+
+    /*Let's populate routing table*/
+    pwospf_lock(sr->ospf_subsys);
+    populateRoutingTable(subnetGraph, sr);
+    pwospf_unlock(sr->ospf_subsys);
+
+    /*sr_print_routing_table(sr);
+    printf("\n\n\n");*/
 
     return 0;
 }
@@ -491,11 +641,10 @@ void sr_handle_pwospf(struct sr_instance *sr, uint8_t* packet,
                 break;
         case ERR_RSP_OSPF_LSU: 
                 err_rsp_no = log_lsu_pkt(sr, packet, len, interface);
-                printGraph(subnetGraph);
                 break;
     }
-    printf("\nOSPF pkt received from %s", interface);
-    printf("\nerr_rsp_no = %d", err_rsp_no);
+    /*printf("\nOSPF pkt received from %s", interface);
+    printf("\nerr_rsp_no = %d", err_rsp_no);*/
 
 }
 
@@ -604,7 +753,7 @@ void* periodic_lsu_handler(void* arg)
     unsigned char mac_src[ETHER_ADDR_LEN];
     uint8_t bufMAC[ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     int len, byteCount, size, result, numSubnets = 0;
-    int i;
+    int i, idx;
 
     /* Packet headers */
     struct sr_ethernet_hdr *ethernet_hdr;
@@ -614,6 +763,9 @@ void* periodic_lsu_handler(void* arg)
     struct ospfv2_lsu *lsa, *lsa_pkt;
 
     uint32_t tmp;
+
+    /*Wait for  seconds before next hello packets are received/sent*/
+    //sleep(7);
 
     while(1)
     {
@@ -696,6 +848,16 @@ void* periodic_lsu_handler(void* arg)
                 tmp = getNeighborRid(lsa[i].subnet);
                 lsa[i].rid = tmp;
 
+                if(tmp == 0)
+                {
+                    idx = getNeighbor(0);
+                    if(getIndex(neighbors[idx].iface) == 0)
+                    {
+                        lsa[i].subnet = 0;
+                        lsa[i].mask = 0;
+                    }
+                }
+
                 lsa_walker = lsa_walker->next;
                 ++i;
             }
@@ -768,6 +930,8 @@ int pwospf_init(struct sr_instance* sr)
         initNeighbor(i);
     }
 
+    fill_arp_cache(sr);
+
     subnetGraph = initGraph();
     initCurrentRouter(subnetGraph);
     addIfaceVertices(subnetGraph, sr);
@@ -818,18 +982,15 @@ void* pwospf_run_thread(void* arg)
         pwospf_lock(sr->ospf_subsys);
         //printf(" pwospf subsystem sleeping \n");
         pthread_mutex_lock(&mutex);
-        printf("\nNeighbors ");
+        /*printf("\nNeighbors ");
         printf("\nRID\t\tIP\t\tIface");
                 
         for(i = 0; i < numInterfaces; ++i)
         {
-            if(neighbors[i].rid != 0)
-            {
-                printf("\n%s", inet_ntoa(*(struct in_addr*)&neighbors[i].rid));
-                printf("\t%s\t%s", inet_ntoa(*(struct in_addr*)&neighbors[i].ip)
+            printf("\n%s", inet_ntoa(*(struct in_addr*)&neighbors[i].rid));
+            printf("\t%s\t%s", inet_ntoa(*(struct in_addr*)&neighbors[i].ip)
                                 , neighbors[i].iface);
-            }
-        }
+        }*/
 
         pthread_mutex_unlock(&mutex);
         pwospf_unlock(sr->ospf_subsys);

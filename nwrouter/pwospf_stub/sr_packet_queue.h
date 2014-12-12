@@ -21,6 +21,7 @@ struct thread_counter
     uint32_t ip;
     unsigned char mac_vrhost[ETHER_ADDR_LEN];
     uint32_t ip_vrhost;
+    int type;
     pthread_t *thread;
 };
 
