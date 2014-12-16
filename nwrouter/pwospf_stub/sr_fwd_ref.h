@@ -36,5 +36,6 @@ void print_ethernet_address(uint8_t *);
 int getIndex(char*);
 long int getProperty(char*);
 void sr_handle_pwospf(struct sr_instance*, uint8_t*, int, char*);
+void send_lsupacket(void*);
 
 #endif /* SR_FWD_REF_H  */
