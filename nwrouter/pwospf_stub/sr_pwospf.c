@@ -32,7 +32,6 @@
 /* -- Global declarations --- */
 pthread_t *hello_thread;
 pthread_t *periodic_lsu_thread;
-pthread_t *link_upDown_lsu_thread;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;    
 pthread_mutex_t nMutex = PTHREAD_MUTEX_INITIALIZER;    
 
@@ -40,7 +39,7 @@ pthread_mutex_t nMutex = PTHREAD_MUTEX_INITIALIZER;
 #define DEAD  0
 
 long int rid, aid = 0; 
-int *isUp, numInterfaces = 0;
+int numInterfaces = 0;
 
 struct sr_ospf_neighbor *neighbors = NULL;
 struct timeval tv;
@@ -95,7 +94,7 @@ void printStack(struct stackNode *stackTop)
     while(cur)
     {
         tmpaddr.s_addr = cur->rid;
-        printf("\nCur RID is %s", inet_ntoa(tmpaddr));
+        printf("\t %s ", inet_ntoa(tmpaddr));
         cur = cur->next;
     }
 }
@@ -481,17 +480,15 @@ void populateRoutingTable(struct graph* G, struct sr_instance *sr)
     struct in_addr dest_addr;
     struct in_addr gw_addr;
     struct in_addr mask_addr;
-    struct in_addr tmpaddr;
 
-    struct vertexList *walker = G->vList, *u, *v, *w;
+    struct vertexList *walker = G->vList, *u;
     struct sr_rt *cur = sr->routing_table;
 
-    int idx, flag = 10, i;
+    int idx, flag = 10;
     while(walker)
     {
         if(walker->v.type == VTYPE_SUBNET)
         {
-            tmpaddr.s_addr = walker->v.subnet;
             u = getVertex(G, walker->v.parent); 
 
             while(u!= NULL && u->v.parent != 0)
@@ -542,8 +539,6 @@ void populateRoutingTable(struct graph* G, struct sr_instance *sr)
 void* timeout(void* arg)
 {
     struct hello_timeout *p = (struct hello_timeout*)arg;
-    int counter = 0;
-    struct in_addr tmp;
 
     while(neighbors[p->nId].timeCounter < p->timeout_t)
     {
@@ -557,9 +552,9 @@ void* timeout(void* arg)
     neighbors[p->nId].isAlive = DEAD;
     /*neighbors[p->nId].rid = 0;*/
     pthread_mutex_unlock(&nMutex);    
-    tmp.s_addr = neighbors[p->nId].rid;
-    printf("\nLink %s failed", inet_ntoa(tmp));
     send_lsupacket((void*)p->sr);
+
+    pthread_exit(NULL);
     return NULL;
 }
 
@@ -582,8 +577,6 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
     unsigned char mac_vrhost[ETHER_ADDR_LEN];
     struct hello_timeout *p = (struct hello_timeout*)malloc(sizeof(struct hello_timeout));
 
-    struct in_addr tmpaddr;
-
     newPacket = (uint8_t*)malloc(arplen);
 
     walker = sr_get_interface(sr, interface);
@@ -601,11 +594,8 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
         neighbors[idx].rid = ospf_hdr->rid;
         neighbors[idx].ip = ip_hdr->ip_src.s_addr;
         neighbors[idx].nmask = hello_packet->nmask;
-        gettimeofday(&tv, NULL);
-        curTime = tv.tv_sec;
         neighbors[idx].isAlive = ALIVE;
-        neighbors[idx].tstamp = curTime;
-        neighbors[idx].resetTimer = neighbors[idx].timeCounter = 0;
+        neighbors[idx].timeCounter = 0;
         neighbors[idx].timer = (pthread_t*)malloc(sizeof(pthread_t));
         pthread_mutex_unlock(&nMutex);
         p->nId = idx;
@@ -619,17 +609,15 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
     }
     else
     {
-        tmpaddr.s_addr = ospf_hdr->rid;
-        printf("\nHello received from %s", inet_ntoa(tmpaddr));
-        gettimeofday(&tv, NULL);
-        curTime = tv.tv_sec;
         pthread_mutex_lock(&nMutex);
-        neighbors[idx].tstamp = curTime;    
-        neighbors[idx].resetTimer = 1;
+        neighbors[idx].timeCounter = 0; 
+        pthread_mutex_unlock(&nMutex);
         if(neighbors[idx].isAlive == DEAD)
         {
+            pthread_mutex_lock(&nMutex);
             neighbors[idx].isAlive = ALIVE;
             neighbors[idx].timer = (pthread_t*)malloc(sizeof(pthread_t));
+            pthread_mutex_unlock(&nMutex);
             p->nId = idx;
             p->timeout_t = OSPF_NEIGHBOR_TIMEOUT;
             p->sr = sr;
@@ -637,8 +625,6 @@ int log_hello_pkt(struct sr_instance *sr, uint8_t* packet,
 
             send_lsupacket((void*)sr);
         }
-        neighbors[idx].timeCounter = 0; 
-        pthread_mutex_unlock(&nMutex);
     }
 
     return 0;
@@ -663,8 +649,6 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
     struct vertexList *v, *w, *tmp1, *tmp2, *tmp, *s;
     struct adjList *e;
 
-    struct in_addr tmpaddr;
-
     struct sr_ethernet_hdr *ethernet_hdr;
     unsigned char mac_src[ETHER_ADDR_LEN];
     
@@ -679,6 +663,7 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
     numAdv = ntohl(lsu_hdr->num_adv);
     memcpy(lsa, lsa_pkt, numAdv * sizeof(struct ospfv2_lsu));
 
+
     if(ospf_hdr->rid == rid)
         return ERR_RSP_OSPF_LSU_DROP;
     else
@@ -686,7 +671,7 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
         tmp = getRouterByRid(subnetGraph, ospf_hdr->rid);
         if(tmp != NULL)
         {
-            if(tmp->v.latestSeqNum >= ntohs(lsu_hdr->seq))
+            if(tmp->v.latestSeqNum > ntohs(lsu_hdr->seq))
                 return ERR_RSP_OSPF_LSU_DROP;
             else tmp->v.latestSeqNum = ntohs(lsu_hdr->seq);
         }
@@ -701,12 +686,8 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
     for(i = 0; i < numAdv; ++i)
     {
         if(getNodeBySubnet(subnetGraph, lsa[i].subnet, ospf_hdr->rid) == NULL)
-        {
-            tmpaddr.s_addr = lsa[i].subnet;        
-            printf("\nAdding subnet %s ", inet_ntoa(tmpaddr));
             addVertex(subnetGraph, ospf_hdr->rid, lsa[i].subnet, 
                       lsa[i].mask, VTYPE_SUBNET);
-        }
         v = getRouterByRid(subnetGraph, ospf_hdr->rid);
         w = getNodeBySubnet(subnetGraph, lsa[i].subnet, ospf_hdr->rid);
         
@@ -733,24 +714,18 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
         // OSPF RID that this router is connected to is 0. Check what to invalidate
         else
         {
-            tmpaddr.s_addr = lsa[i].subnet;
-            printf("\nSubnet is %s", inet_ntoa(tmpaddr));
             tmp1 = getRouterByRid(subnetGraph, ospf_hdr->rid);
             e = tmp1->v.head;
-            printf("\nTmp1 ID is %d ", tmp1->v.id);
             if(lsa[i].subnet != 0)
             {
                 while(e)
                 {
-                    printf("\n-> %d", e->e.to);
                     tmp2 = getVertex(subnetGraph, e->e.to);
                     if(tmp2 != NULL)
                         if(tmp2->v.type == VTYPE_ROUTER)
                             push(tmp2->v.rid);
                     e = e->next;
                 }
-                printf("\nStack is ");
-                printStack(stackTop);
 
                 while(stackTop)
                 {
@@ -769,45 +744,41 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
 
                     if(flag)
                     {
-                        printf("\nFail case");
-                        
                         e = getEdge(tmp1, tmp->v.id);
-                        printf("\ndeleting edge %d->%d", e->e.from, e->e.to);
                         deleteNode((void*)&tmp1->v.head, (void*)&e, EDGE);
                         e = getEdge(tmp, tmp1->v.id);
-                        printf("\ndeleting edge %d->%d", e->e.from, e->e.to);
                         deleteNode((void*)&tmp->v.head, (void*)&e, EDGE);
 
                     }
+                    else flag = 10;
                 }
             }
         }
-        lsu_hdr->ttl--;
-        walker = sr->if_list;
-        while(walker)
-        {
-            memcpy(mac_src, walker->addr, ETHER_ADDR_LEN);            
-            ethernet_hdr = (struct sr_ethernet_hdr*)packet;
-            byteCount = 0;
-            while(byteCount < ETHER_ADDR_LEN) 
-            {  
-                ethernet_hdr->ether_shost[byteCount] = *(uint8_t*)(&mac_src[byteCount]);
-                byteCount++;
-            }
-
-            twoByte = (uint16_t*)ospf_hdr;
-            result = compute_checksum(twoByte, ntohs(ospf_hdr->len), 7);
-            ospf_hdr->csum = htons(result);
-
-            if(strcmp(walker->name, interface) != 0)
-                sr_send_packet(sr, packet, len, walker->name);
-                    
-            walker = walker->next;
+        
+    }
+    lsu_hdr->ttl--;
+    walker = sr->if_list;
+    while(walker)
+    {
+        memcpy(mac_src, walker->addr, ETHER_ADDR_LEN);            
+        ethernet_hdr = (struct sr_ethernet_hdr*)packet;
+        byteCount = 0;
+        while(byteCount < ETHER_ADDR_LEN) 
+        {  
+            ethernet_hdr->ether_shost[byteCount] = *(uint8_t*)(&mac_src[byteCount]);
+            byteCount++;
         }
+
+        twoByte = (uint16_t*)ospf_hdr;
+        result = compute_checksum(twoByte, ntohs(ospf_hdr->len), 7);
+        ospf_hdr->csum = htons(result);
+
+        if(strcmp(walker->name, interface) != 0)
+            sr_send_packet(sr, packet, len, walker->name);
+        walker = walker->next;
     }
     s = getRouterByRid(subnetGraph, rid);
     dijkstra(subnetGraph, s);
-    printGraph(subnetGraph);
 
     /*Let's populate routing table*/
     pwospf_lock(sr->ospf_subsys);
@@ -815,9 +786,8 @@ int log_lsu_pkt(struct sr_instance *sr, uint8_t* packet,
     pwospf_unlock(sr->ospf_subsys);
     
 
-    sr_print_routing_table(sr);
-    printf("\n\n\n");
-
+/*    sr_print_routing_table(sr);
+*/
     return 0;
 }
 
@@ -871,9 +841,9 @@ void sr_handle_pwospf(struct sr_instance *sr, uint8_t* packet,
                 err_rsp_no = log_lsu_pkt(sr, packet, len, interface);
                 break;
     }
-    /*printf("\nOSPF pkt received from %s", interface);
-    printf("\nerr_rsp_no = %d", err_rsp_no);*/
-
+/*    printf("\nOSPF pkt received from %s", interface);
+    printf("\nerr_rsp_no = %d", err_rsp_no);
+*/
 }
 
 void send_lsupacket(void* arg)
@@ -886,7 +856,7 @@ void send_lsupacket(void* arg)
     unsigned char mac_src[ETHER_ADDR_LEN];
     uint8_t bufMAC[ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     int len, byteCount, size, result, numSubnets = 0;
-    int i, idx, buf;
+    int i, idx;
 
     /* Packet headers */
     struct sr_ethernet_hdr *ethernet_hdr;
@@ -895,10 +865,6 @@ void send_lsupacket(void* arg)
     struct ospfv2_lsu_hdr *lsu_hdr;
     struct ospfv2_lsu *lsa, *lsa_pkt;
 
-    uint32_t tmp;
-    struct in_addr tmpaddr;
-
-    printf("\nSending LSU packet");
     pthread_mutex_lock(&mutex);
     walker = sr->if_list;
     numSubnets = 0;
@@ -964,7 +930,6 @@ void send_lsupacket(void* arg)
         lsu_hdr->seq = htons(lsu_seq);
         lsu_hdr->unused = 0;
         lsu_hdr->ttl = 64;
-        printf("\nNum adv is %d", numSubnets);
         lsu_hdr->num_adv = htonl(numSubnets);
 
         lsa = (struct ospfv2_lsu*)malloc(numSubnets * sizeof(struct ospfv2_lsu));
@@ -972,16 +937,8 @@ void send_lsupacket(void* arg)
                         + sizeof(struct ip) + sizeof(struct ospfv2_hdr)
                         + sizeof(struct ospfv2_lsu_hdr));
 
-        lsa_walker = sr->if_list;
-        while(lsa_walker)
-        {
-            tmpaddr.s_addr = lsa_walker->ip;
-            printf("\nLSA IP %s eth %s", inet_ntoa(tmpaddr), lsa_walker->name);
-            lsa_walker = lsa_walker->next;
-        }
         i = 0;
         lsa_walker = sr->if_list;
-        printf("\nLSA contents :: ");
         while(lsa_walker)
         {
             lsa[i].subnet = lsa_walker->ip & lsa_walker->mask;
@@ -991,8 +948,6 @@ void send_lsupacket(void* arg)
             lsa[i].rid = tmp;*/
 
             idx = getNeighborIDwithSubnet(lsa[i].subnet);
-            tmpaddr.s_addr = lsa[i].subnet;
-            printf("\nID in list is %d subnet is %s", idx, inet_ntoa(tmpaddr));
             if(neighbors[idx].rid == 0 && getIndex(neighbors[idx].iface) == 0)
             {
                 lsa[i].subnet = 0;
@@ -1001,22 +956,6 @@ void send_lsupacket(void* arg)
 
             lsa[i].rid = neighbors[idx].isAlive ? neighbors[idx].rid : 0;
 
-            /*if(tmp == 0)  
-            {
-                idx = getNeighbor(0);
-                if(getIndex(neighbors[idx].iface) == 0)
-                {
-                    lsa[i].subnet = 0;
-                    lsa[i].mask = 0;
-                }
-            }*/
-
-            tmpaddr.s_addr = lsa[i].subnet;
-            printf("\nSubnet %s", inet_ntoa(tmpaddr));
-            tmpaddr.s_addr = lsa[i].mask;
-            printf(" mask %s", inet_ntoa(tmpaddr));
-            tmpaddr.s_addr = lsa[i].rid;
-            printf(" Rid %s", inet_ntoa(tmpaddr));
             ++i;
             lsa_walker = lsa_walker->next;
             
@@ -1028,15 +967,12 @@ void send_lsupacket(void* arg)
         result = compute_checksum(twoByte, ntohs(ospf_hdr->len), 7);
         ospf_hdr->csum = htons(result);
 
-        printf("\n");
-
         //sr_print_packet_contents(sr, newPacket, len, walker->name);
         sr_send_packet(sr, newPacket, len, walker->name);
 
         walker = walker->next;
     }
     pthread_mutex_unlock(&mutex);
-    sleep(OSPF_DEFAULT_LSUINT);
     lsu_seq++;
 }
 
@@ -1141,13 +1077,8 @@ void* periodic_lsu_handler(void* arg)
     while(1)
     {
         send_lsupacket(arg);
+        sleep(OSPF_DEFAULT_LSUINT);
     }
-
-    return NULL;
-}
-
-void* link_upDown_lsu_handler(void *arg)
-{
 
     return NULL;
 }
@@ -1185,9 +1116,7 @@ int pwospf_init(struct sr_instance* sr)
     /* -- handle subsystem initialization here! -- */
     hello_thread = (pthread_t*)malloc(sizeof(pthread_t));
     periodic_lsu_thread = (pthread_t*)malloc(sizeof(pthread_t));
-    link_upDown_lsu_thread = (pthread_t*)malloc(sizeof(pthread_t));
 
-    isUp = (int*)malloc(numInterfaces * sizeof(int));
     neighbors = (struct sr_ospf_neighbor*)malloc(numInterfaces 
                                           * sizeof(struct sr_ospf_neighbor));
 
@@ -1195,7 +1124,6 @@ int pwospf_init(struct sr_instance* sr)
     walker = sr->if_list;
     while(walker)
     {
-        isUp[i] = ALIVE;
         initNeighbor(walker, i);
         i++;
         walker = walker->next;
@@ -1225,11 +1153,6 @@ int pwospf_init(struct sr_instance* sr)
         assert(0);
     }
     
-    if( pthread_create(&link_upDown_lsu_thread[0], NULL, link_upDown_lsu_handler, sr))
-    {
-        perror("pthread_create");
-        assert(0);
-    }
     return 0; /* success */
 } /* -- pwospf_init -- */
 
@@ -1244,7 +1167,7 @@ static
 void* pwospf_run_thread(void* arg)
 {
     struct sr_instance* sr = (struct sr_instance*)arg;
-    int i;
+    /*int i;*/
 
     while(1)
     {
@@ -1253,7 +1176,7 @@ void* pwospf_run_thread(void* arg)
         pwospf_lock(sr->ospf_subsys);
         //printf(" pwospf subsystem sleeping \n");
         pthread_mutex_lock(&mutex);
-        printf("\nNeighbors ");
+/*        printf("\nNeighbors ");
         printf("\nSubnet\t\tRID\t\tIP\t\tIface\tisAlive");
                 
         for(i = 0; i < numInterfaces; ++i)
@@ -1264,10 +1187,10 @@ void* pwospf_run_thread(void* arg)
                                 , neighbors[i].iface);
             printf("\t%d", neighbors[i].isAlive);
         }
-
+*/
         pthread_mutex_unlock(&mutex);
         pwospf_unlock(sr->ospf_subsys);
-        sleep(4);
+        sleep(2);
         //printf(" pwospf subsystem awake \n");
     };
 

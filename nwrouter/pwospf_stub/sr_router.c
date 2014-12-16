@@ -209,7 +209,7 @@ void *timeout_handler(void *arg)
 void add_arp_cache_tuple(struct sr_arp_cache *tuple)
 {
     struct sr_arp_cache *new;
-    struct timeouts *p;
+    /*struct timeouts *p;*/
 
     new = (struct sr_arp_cache*)malloc(sizeof(struct sr_arp_cache));
     new->arp_type = tuple->arp_type; new->arp_sip = tuple->arp_sip;
@@ -726,7 +726,7 @@ int sr_ip_forwarding(struct sr_instance *sr,
     
     if(retval)
     {
-        if(ip_hdr->ip_ttl <= 1)
+        if(ip_hdr->ip_ttl == 1)
         { err_rsp_no = ERR_RSP_ICMP_TOUT; }
         else ip_hdr->ip_ttl--;
 
@@ -1102,13 +1102,15 @@ int count_umask_bits(uint32_t num)
 struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
                       struct in_addr ip)
 {
-    struct sr_rt *rtable_entry = NULL, *greatest_match = NULL, *longestPrefix = NULL;
-    uint32_t buf = 0;
-    int numBits, notGateway = 0;
+    struct sr_rt *rtable_entry = NULL, *longestPrefix = NULL;
+    /*uint32_t buf = 0;*/
+    int notGateway = 0;
 
     struct sr_rt *gw_entry;
-    struct in_addr dest, tmp;
+    struct in_addr dest;
     
+    pwospf_lock(sr->ospf_subsys);
+
     rtable_entry = sr->routing_table;
     if(rtable_entry == NULL) return NULL;
 
@@ -1146,6 +1148,7 @@ struct sr_rt* sr_rtable_prefix_lookup(struct sr_instance* sr,
     }
         rtable_entry = rtable_entry->next;
     }
+    pwospf_unlock(sr->ospf_subsys);
 
     if(longestPrefix == NULL)
         longestPrefix = gw_entry;
@@ -1288,7 +1291,7 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
     /* Could still be the old packet */
     newPacket = packet; 
 
-    //printf("\nERR is %d and next_hop is %s", err_rsp_no, inet_ntoa(next_hop));
+    /*printf("\nERR is %d and next_hop is %s", err_rsp_no, inet_ntoa(next_hop));*/
 
     /* Resolve interfaces - where the packet is going to */    
     switch(err_rsp_no)
@@ -1463,16 +1466,16 @@ int sr_forward_packet(struct sr_instance* sr, struct sr_ethernet_hdr *ethernet_h
         {
             case ERR_RSP_ICMP_TOUT: case ERR_RSP_ICMP_PU: case ERR_RSP_ICMP_HU:
             case ERR_RSP_ICMP_ECHO_REP: case ERR_RSP_ARP_REP: 
-                printf("\nRight before send:%s", fromInterface); 
+                //printf("\nRight before send:%s", fromInterface); 
                 /* For Debugging. Printing contents of packet just before sending it */
-                sr_print_packet_contents(sr, newPacket, len, fromInterface);
+                //sr_print_packet_contents(sr, newPacket, len, fromInterface);
                 /*Packet is ready and valid. Send it */
                 sr_send_packet(sr, newPacket, len, fromInterface);
                 break;
             case ERR_RSP_IP_FWD: case ERR_RSP_ARP_REQ_SNET: case ERR_RSP_ARP_REQ_GWAY:
-                printf("\nRight before send:%s", toInterface); 
+                //printf("\nRight before send:%s", toInterface); 
                 /* For Debugging. Printing contents of packet just before sending it */
-                sr_print_packet_contents(sr, newPacket, len, toInterface);
+                //sr_print_packet_contents(sr, newPacket, len, toInterface);
                 /*Packet is ready and valid. Send it */
                 sr_send_packet(sr, newPacket, len, toInterface);
                 break;

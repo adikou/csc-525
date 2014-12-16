@@ -26,6 +26,7 @@ struct pwospf_subsys
 };
 
 int pwospf_init(struct sr_instance* sr);
-
+void pwospf_lock(struct pwospf_subsys* );
+void pwospf_unlock(struct pwospf_subsys* );
 
 #endif /* SR_PWOSPF_H */
